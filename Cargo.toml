@@ -1,0 +1,29 @@
+[package]
+name = "upxz"
+version = "0.1.0"
+authors = ["ljh-sh <lijunhao@x-cmd.com>"]
+edition = "2021"
+rust-version = "1.74"
+description = "Tiny single-binary file packer. One file in, one file out, magic-checked, zstd-packed."
+readme = "README.md"
+homepage = "https://github.com/ljh-sh/upxz"
+documentation = "https://github.com/ljh-sh/upxz#readme"
+license = "Apache-2.0"
+repository = "https://github.com/ljh-sh/upxz"
+keywords = ["zstd", "pack", "compress", "cli", "single-binary"]
+categories = ["compression", "command-line-utilities"]
+exclude = [".release-artifacts/", ".github/", "target/", "*.swp", "*.swo", "*~", ".DS_Store"]
+
+[[bin]]
+name = "upxz"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+zstd = "0.13"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
