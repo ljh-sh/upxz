@@ -62,6 +62,17 @@ struct Cli {
     /// Verbose.
     #[arg(short = 'v', long = "verbose")]
     verbose: bool,
+
+    /// Trailing args after `--`, forwarded verbatim to the restored binary on
+    /// run. Captured with `trailing_var_arg` + `allow_hyphen_values` so
+    /// `upxz foo.upxz -- -a -b` passes `-a -b` (including hyphen-leading ones)
+    /// to the inner program rather than letting upxz parse them itself.
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "ARGS"
+    )]
+    trailing: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -78,7 +89,7 @@ fn main() -> Result<()> {
     // default action: auto-detect by magic
     let head = read_head(&cli.file, MAGIC.len())?;
     if has_magic(&head) {
-        run(&cli.file, cli.quiet)
+        run(&cli.file, cli.quiet, &cli.trailing)
     } else {
         pack(&cli.file, cli.level.resolve(), cli.force, cli.quiet)
     }
@@ -174,8 +185,15 @@ fn unpack(input: &Path, force: bool, quiet: bool) -> Result<()> {
 }
 
 /// Run a `.upxz` container: decompress the original to a temp file and exec it,
-/// propagating the child's exit code. Temp file is removed after the child exits.
-fn run(file: &Path, quiet: bool) -> Result<()> {
+/// propagating the child's exit code. Trailing args (after `--`) are forwarded
+/// verbatim to the restored binary. The temp file is removed after the child
+/// exits.
+///
+/// On macOS a restored copy of a signed Mach-O no longer matches its original
+/// signature, so AMFI kills it with SIGKILL (exit 137) on exec. We re-sign the
+/// temp copy ad-hoc (`codesign --sign - --force`) so the kernel accepts it.
+/// Linux needs no signing.
+fn run(file: &Path, quiet: bool, trailing: &[String]) -> Result<()> {
     let buf = read_input_file(file)?;
     let (header, payload_offset) = parse_header(&buf)?;
     let original = zstd::decode_all(&buf[payload_offset..])
@@ -188,6 +206,27 @@ fn run(file: &Path, quiet: bool) -> Result<()> {
     ));
     fs::write(&tmp, &original)
         .with_context(|| format!("cannot write restored binary to {}", tmp.display()))?;
+    #[cfg(target_os = "macos")]
+    {
+        // Ad-hoc re-sign the temp copy: macOS AMFI SIGKILLs (exit 137) a copied
+        // signed binary on exec otherwise. `--force` overwrites the stale
+        // signature. A non-zero status is fatal — without a valid signature the
+        // child cannot run at all. Done before the chmod to 0o500 below, because
+        // codesign must write the new signature to the file.
+        let cs = std::process::Command::new("codesign")
+            .args(["--sign", "-", "--force", "--"])
+            .arg(&tmp)
+            .output()
+            .with_context(|| "failed to spawn codesign")?;
+        if !cs.status.success() {
+            bail!(
+                "codesign failed on {} (exit {:?}): {}",
+                tmp.display(),
+                cs.status.code(),
+                String::from_utf8_lossy(&cs.stderr).trim()
+            );
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -206,6 +245,7 @@ fn run(file: &Path, quiet: bool) -> Result<()> {
     }
 
     let status = std::process::Command::new(&tmp)
+        .args(trailing)
         .status()
         .with_context(|| format!("failed to exec restored binary {}", tmp.display()))?;
     let _ = fs::remove_file(&tmp);
