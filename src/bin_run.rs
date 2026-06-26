@@ -155,14 +155,35 @@ fn exec_memfd_linux(name: &str, bytes: &[u8], trailing: &[String]) -> Result<()>
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    // memfd_create with a name that is purely advisory. Close-on-exec is set
-    // so the fd does not leak into the child (we use fexecve, which consumes
-    // it during the syscall rather than via /proc/self/fd).
+    // MFD_EXEC (0x10): marks the memfd executable. REQUIRED on Linux 6.3+ under
+    // vm.memfd_noexec=1|2 (the secure default on hardened distros). We do NOT
+    // set MFD_CLOEXEC (see the comment above the memfd_create call below).
+    const MFD_EXEC: u32 = 0x0010;
+
+    // memfd_create with a name that is purely advisory. We deliberately do NOT
+    // set MFD_CLOEXEC: the fexecve primary path consumes the fd during the
+    // syscall, but the /proc/self/fd fallback execve (used on systems where
+    // fexecve is a no-op/ENOSYS) must be able to re-open the memfd after exec,
+    // which CLOEXEC forbids. MFD_EXEC marks it executable on hardened kernels
+    // (vm.memfd_noexec). See the stub crate's `create_exec_memfd` for the full
+    // MFD_EXEC / no-CLOEXEC rationale.
     let mem_name = CString::new("upxz-bin").unwrap();
-    let fd = unsafe { libc::memfd_create(mem_name.as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error()).context("memfd_create failed");
-    }
+    let fd = unsafe { libc::memfd_create(mem_name.as_ptr(), MFD_EXEC) };
+    let fd = if fd >= 0 {
+        fd
+    } else {
+        // Older kernels (< 6.3) do not know MFD_EXEC and return EINVAL; retry
+        // with flags=0 (those kernels default memfds to executable).
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if errno != libc::EINVAL {
+            return Err(std::io::Error::last_os_error()).context("memfd_create failed");
+        }
+        let fd2 = unsafe { libc::memfd_create(mem_name.as_ptr(), 0) };
+        if fd2 < 0 {
+            return Err(std::io::Error::last_os_error()).context("memfd_create failed");
+        }
+        fd2
+    };
     // Wrap the fd so it is closed if any step below fails.
     let owned = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
     let mut written = 0usize;
