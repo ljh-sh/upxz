@@ -133,11 +133,11 @@ fn normalize_tar_path(p: &str) -> String {
 fn exec_inner(name: &str, bytes: &[u8], trailing: &[String]) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        return exec_memfd_linux(name, bytes, trailing);
+        exec_memfd_linux(name, bytes, trailing)
     }
     #[cfg(target_os = "macos")]
     {
-        return exec_temp_macos(name, bytes, trailing);
+        exec_temp_macos(name, bytes, trailing)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {

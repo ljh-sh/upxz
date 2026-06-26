@@ -6,7 +6,7 @@
 //! - pack  : `upxz <file>`           -> writes `<file>.upxz`
 //! - run   : `upxz <file>.upxz`      -> decompress + exec (propagates exit code)
 //! - --bin : `upxz --bin <inner> <a.tar.zst> -- args` -> stream-extract one
-//!           entry from a .tar.zst and exec it (no full extraction)
+//!   entry from a .tar.zst and exec it (no full extraction)
 //! - -d    : unpack, byte-for-byte round-trip
 //! - -l/-t : list / test, exit 0 + expected fields
 //! - level : `--fast`, `-z N`, default — all must produce a valid container
@@ -609,10 +609,9 @@ fn build_tar_zst(src_dir: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
         .arg(".")
         .status()?;
     if !st.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("tar exited {st:?}; is tar on PATH?"),
-        ));
+        return Err(std::io::Error::other(format!(
+            "tar exited {st:?}; is tar on PATH?"
+        )));
     }
     // zstd -19 -f tmp.tar -o dst
     let st = Command::new("zstd")
@@ -622,10 +621,9 @@ fn build_tar_zst(src_dir: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
         .arg(dst)
         .status()?;
     if !st.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("zstd exited {st:?}; is zstd on PATH?"),
-        ));
+        return Err(std::io::Error::other(format!(
+            "zstd exited {st:?}; is zstd on PATH?"
+        )));
     }
     let _ = fs::remove_file(&tmp_tar);
     Ok(())

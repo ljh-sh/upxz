@@ -424,6 +424,7 @@ fn pack_sfx(
 
 /// Linux SFX: `[ stub ][ .upxz container ][ trailer: u64 stub_size BE ]`.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)] // 8 args: all are distinct inputs the SFX layout needs.
 fn pack_sfx_linux(
     input: &Path,
     output: &Path,
@@ -496,6 +497,7 @@ fn pack_sfx_linux(
 /// ad-hoc codesigns that, and `execv`s it. See mneme `docs/upxz/` for the full
 /// design and the codesign-decision trade-off.
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)] // 8 args: all are distinct inputs the SFX layout needs.
 fn pack_sfx_macos(
     input: &Path,
     output: &Path,
