@@ -49,7 +49,7 @@ opt-level = "z"
 codegen-units = 1
 
 [workspace]
-members = [".", "stub"]
+members = [".", "stub", "winstub"]
 
 # Note: the macOS `upxz-loader` crate (`loader/`) is **deliberately not** a
 # workspace member. It is `#![no_std]` + `#![no_main]` and requires its own
