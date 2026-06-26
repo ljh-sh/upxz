@@ -153,9 +153,22 @@ const TRAILER_LEN: usize = 16;
 // bump it.
 const MAGIC_TRAILER: &[u8; 8] = b"UPXZEND1";
 
-// upxz container magic: ASCII `UPXZ\x01\x00\x00\x00` (matches format::MAGIC).
-const MAGIC_UPXZ: &[u8; 8] = b"UPXZ\x01\x00\x00\x00";
-const UPXZ_HEADER_FIXED: usize = MAGIC_UPXZ.len() + 4; // magic + name_len
+// upxz container magic prefix: ASCII `UPXZ` + version `0x01` (5 bytes). The
+// full 8-byte magic is `[UPXZ\x01][codec][0x00][0x00]`; the codec byte at
+// offset 5 (CODEC_OFFSET) selects the decompressor. This loader is zstd-only
+// (codec id 0) for size: it is no_std + zstd-sys FFI and cannot carry a gzip
+// decoder without blowing the < 100 KB gate. A gzip container (codec id 1) is
+// detected here and rejected with a clear message — pack with zstd (drop --gz)
+// or use the cross-platform `upxz run` runner path instead. Matches
+// `upxz::format::MAGIC_PREFIX` / `CODEC_OFFSET`.
+const MAGIC_UPXZ_PREFIX: &[u8; 5] = b"UPXZ\x01";
+const CODEC_OFFSET: usize = 5;
+const CODEC_ZSTD: u8 = 0;
+const CODEC_GZIP: u8 = 1;
+// The full magic length is 8 (prefix + codec + 2 reserved). We still need this
+// to compute the name_len offset below.
+const UPXZ_MAGIC_LEN: usize = 8;
+const UPXZ_HEADER_FIXED: usize = UPXZ_MAGIC_LEN + 4; // magic + name_len
 
 // zstd content-size sentinels.
 const ZSTD_CONTENTSIZE_UNKNOWN: u64 = u64::MAX;
@@ -345,10 +358,46 @@ unsafe fn real_main(argc: c_int, argv: *const *const c_char) -> c_int {
         free(app_buf as *mut c_void);
         return EXIT_FORMAT;
     }
-    if core::slice::from_raw_parts(app_buf, MAGIC_UPXZ.len()) != *MAGIC_UPXZ {
+    // Validate the 5-byte magic prefix, the reserved bytes (must be 0), and
+    // the codec byte. The loader is zstd-only; a gzip container is rejected
+    // here with a distinct message so the user knows to repack or use the
+    // runner path.
+    if core::slice::from_raw_parts(app_buf, MAGIC_UPXZ_PREFIX.len()) != *MAGIC_UPXZ_PREFIX {
         warn(
             2,
-            b"upxz-loader: app segment does not start with the upxz magic\n",
+            b"upxz-loader: app segment does not start with the upxz magic prefix\n",
+        );
+        free(app_buf as *mut c_void);
+        return EXIT_FORMAT;
+    }
+    // Reserved bytes at offsets 6, 7 must be zero.
+    if *app_buf.add(MAGIC_UPXZ_PREFIX.len() + 1) != 0
+        || *app_buf.add(MAGIC_UPXZ_PREFIX.len() + 2) != 0
+    {
+        warn(
+            2,
+            b"upxz-loader: bad magic (reserved bytes non-zero; not a known upxz format)\n",
+        );
+        free(app_buf as *mut c_void);
+        return EXIT_FORMAT;
+    }
+    let codec_byte = *app_buf.add(CODEC_OFFSET);
+    if codec_byte == CODEC_GZIP {
+        // The no_std loader is zstd-only for size; it cannot decode gzip. The
+        // user should repack with zstd (drop --gz) or run via the external
+        // `upxz` runner, which supports both codecs.
+        warn(
+            2,
+            b"upxz-loader: container uses gzip codec, but the macOS loader is zstd-only; \
+             repack without --gz or run via `upxz <file>.upxz`\n",
+        );
+        free(app_buf as *mut c_void);
+        return EXIT_FORMAT;
+    }
+    if codec_byte != CODEC_ZSTD {
+        warn(
+            2,
+            b"upxz-loader: unknown upxz codec byte in magic (not zstd or gzip)\n",
         );
         free(app_buf as *mut c_void);
         return EXIT_FORMAT;

@@ -12,6 +12,20 @@ Refs: mneme#41, upxz PR#5 (Linux memfd), #6 (macOS three-part A, superseded), #7
 
 # Unreleased
 
+- **Codec-agnostic container (`--gz`)**: the magic byte at offset 5 now carries
+  a codec id — `0` = zstd (default, fully backward-compatible), `1` = gzip. The
+  runner / unpacker / list / test paths all dispatch on this byte, so one upxz
+  binary handles both codecs. `--gz` on pack selects gzip; `-z N` clamps to the
+  DEFLATE range 1..=9 (default 9). Without `--gz`, pack writes zstd (codec 0),
+  identical to v0.2 — every existing `.upxz` still runs unchanged.
+- **Backends**: gzip via `flate2` with the pure-Rust `miniz_oxide` backend (no
+  C `libz`, statically linked). zstd unchanged.
+- **Linux SFX stub** supports both codecs. **macOS SFX loader** stays
+  **zstd-only** for size (no_std + zstd-sys FFI, ~84 KB, < 1/5 of upxz); gzip on
+  macOS goes through the cross-platform `upxz run` runner path.
+- 6 new gzip integration tests + 1 backward-compat guard; 47 tests pass total.
+- Refs: mneme `story/feature/260626.upxz-tech/` §codec-agnostic.
+
 - **`upxz --bin <inner-path> <archive.tar.zst> [-- args...]`**: run a single
   designated binary directly out of a `.tar.zst` archive **without extracting
   the whole archive** (AppImage-style). Streams zstd → tar, materializes only

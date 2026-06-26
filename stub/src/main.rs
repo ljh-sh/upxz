@@ -5,27 +5,40 @@
 //! a self-contained executable `packed` whose layout is:
 //!
 //! ```text
-//! [ stub ELF bytes ][ .upxz container (magic+namelen+name+zstd) ][ trailer: u64 stub_size BE ]
+//! [ stub ELF bytes ][ .upxz container (magic+namelen+name+payload) ][ trailer: u64 stub_size BE ]
 //! ```
 //!
 //! When `packed` is executed the stub:
 //!   1. reads `/proc/self/exe` (its own image),
 //!   2. reads the last 8 bytes to learn `stub_size`,
 //!   3. slices `.upxz` starting at `stub_size`,
-//!   4. parses the header + zstd payload,
-//!   5. creates a memfd (MFD_CLOEXEC), writes the decompressed original to it,
-//!   6. `fexecve`s it with argv[0] = stored original name, forwarding argv[1..]
+//!   4. parses the header (magic + name) and reads the **codec id** out of
+//!      the magic byte at offset 5 (0 = zstd, 1 = gzip),
+//!   5. decompresses the payload through the matching backend
+//!      (zstd::decode_all for zstd, flate2/miniz_oxide for gzip),
+//!   6. creates a memfd (MFD_EXEC, no CLOEXEC), writes the original to it,
+//!   7. `fexecve`s it with argv[0] = stored original name, forwarding argv[1..]
 //!      and the inherited environment.
 //!
 //! No temp file is written to disk — the original lives only in memory for the
-//! lifetime of the exec'd process. Linux-only.
+//! lifetime of the exec'd process. Linux-only. The stub supports both codecs
+//! (zstd + gzip) because it is a normal std binary with no size gate, unlike
+//! the macOS no_std loader which stays zstd-only.
 
 use std::io::Read;
 
-/// upxz container magic: ASCII `UPXZ\x01\x00\x00\x00`. Kept in sync with
-/// `upxz::format::MAGIC`. Duplicated here so the stub crate stays standalone
-/// (no cross-crate link into the packer).
-const MAGIC: [u8; 8] = *b"UPXZ\x01\x00\x00\x00";
+/// upxz container magic prefix: ASCII `UPXZ` + version `0x01` (5 bytes). The
+/// full 8-byte magic is `[UPXZ\x01][codec][0x00][0x00]`; the codec byte at
+/// offset 5 selects the decompressor. Kept in sync with
+/// `upxz::format::MAGIC_PREFIX` / `CODEC_OFFSET`. Duplicated here so the stub
+/// crate stays standalone (no cross-crate link into the packer).
+const MAGIC_PREFIX: [u8; 5] = *b"UPXZ\x01";
+const CODEC_OFFSET: usize = 5;
+
+/// Codec ids (mirrors `upxz::format::Codec`). The stub dispatches on the byte
+/// read from the magic.
+const CODEC_ZSTD: u8 = 0;
+const CODEC_GZIP: u8 = 1;
 
 /// Trailer length, in bytes: a single big-endian u64 recording the stub size.
 const TRAILER_LEN: usize = 8;
@@ -110,20 +123,31 @@ fn run() -> Result<(), String> {
     // 3. The `.upxz` container lives between `stub_size` and the trailer.
     let upxz = &image[stub_size..image.len() - TRAILER_LEN];
 
-    // 4. Parse header: magic + 4-byte BE name length + name bytes, then zstd.
-    if upxz.len() < MAGIC.len() + 4 {
+    // 4. Parse header: magic prefix (5 bytes) + codec byte + 2 reserved bytes
+    //    + 4-byte BE name length + name bytes, then the compressed payload.
+    if upxz.len() < MAGIC_PREFIX.len() + 3 + 4 {
         return Err("trailer points at a region too small to be a .upxz container".to_string());
     }
-    if upxz[..MAGIC.len()] != MAGIC {
-        return Err("trailer region does not start with the upxz magic".to_string());
+    if upxz[..MAGIC_PREFIX.len()] != MAGIC_PREFIX {
+        return Err("trailer region does not start with the upxz magic prefix".to_string());
+    }
+    // Reserved bytes (offsets 6, 7) must be zero today.
+    if upxz[MAGIC_PREFIX.len() + 1] != 0 || upxz[MAGIC_PREFIX.len() + 2] != 0 {
+        return Err("bad magic: reserved bytes are non-zero (not a known upxz format)".to_string());
+    }
+    let codec_byte = upxz[CODEC_OFFSET];
+    if codec_byte != CODEC_ZSTD && codec_byte != CODEC_GZIP {
+        return Err(format!(
+            "unknown upxz codec id {codec_byte} in stub (only 0=zstd, 1=gzip are defined)"
+        ));
     }
     let name_len = u32::from_be_bytes([
-        upxz[MAGIC.len()],
-        upxz[MAGIC.len() + 1],
-        upxz[MAGIC.len() + 2],
-        upxz[MAGIC.len() + 3],
+        upxz[MAGIC_PREFIX.len() + 3],
+        upxz[MAGIC_PREFIX.len() + 4],
+        upxz[MAGIC_PREFIX.len() + 5],
+        upxz[MAGIC_PREFIX.len() + 6],
     ]) as usize;
-    let name_start = MAGIC.len() + 4;
+    let name_start = MAGIC_PREFIX.len() + 3 + 4;
     let payload_start = name_start
         .checked_add(name_len)
         .ok_or("name length overflows usize")?;
@@ -136,9 +160,23 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("stored original name is not valid UTF-8: {e}"))?;
     let payload = &upxz[payload_start..];
 
-    // 5. Decompress. The payload is a raw zstd frame of the original file.
-    let original =
-        zstd::decode_all(payload).map_err(|e| format!("zstd decompression failed: {e}"))?;
+    // 5. Decompress. Dispatch on the codec byte in the magic: zstd for id 0,
+    //    gzip (flate2/miniz_oxide) for id 1. Both backends are linked into the
+    //    stub; the stub is a normal std binary with no size gate, so unlike the
+    //    macOS no_std loader it can carry both decoders.
+    let original = match codec_byte {
+        CODEC_ZSTD => zstd::decode_all(payload)
+            .map_err(|e| format!("zstd decompression failed: {e}"))?,
+        CODEC_GZIP => {
+            let mut dec = flate2::read::GzDecoder::new(payload);
+            let mut out = Vec::new();
+            dec.read_to_end(&mut out)
+                .map_err(|e| format!("gzip decompression failed: {e}"))?;
+            out
+        }
+        // Unreachable: codec_byte is validated above.
+        other => return Err(format!("internal error: unhandled codec id {other}")),
+    };
 
     // 6. memfd_create + write + fexecve. We request MFD_EXEC so the memfd is
     //    executable on hardened kernels (vm.memfd_noexec). We do NOT set

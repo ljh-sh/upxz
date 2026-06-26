@@ -724,3 +724,125 @@ fn bin_missing_entry_errors() {
         let _ = sb;
     }
 }
+
+// ---------------------------------------------------------------------------
+// codec-agnostic: --gz selects gzip (codec id 1 in the magic). The whole
+// read path (run / unpack / list / test) must dispatch by the codec byte, and
+// a zstd container (codec id 0) must still round-trip (backward compat).
+// ---------------------------------------------------------------------------
+
+fn assert_has_gzip_magic(path: &PathBuf) {
+    let bytes = fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    assert!(bytes.len() >= 8, "{} too small", path.display());
+    assert_eq!(&bytes[..5], b"UPXZ\x01", "magic prefix wrong");
+    assert_eq!(bytes[5], 1, "codec byte must be 1 (gzip) in {}", path.display());
+    assert_eq!(bytes[6], 0, "reserved byte 6 must be 0");
+    assert_eq!(bytes[7], 0, "reserved byte 7 must be 0");
+}
+
+#[test]
+fn pack_gz_writes_gzip_magic() {
+    let sb = Sandbox::new("pack-gz-magic");
+    let input = sb.write("hello.txt", b"hello upxz gzip\n".repeat(64).as_slice());
+    let expected = sb.expected("hello.txt.upxz");
+
+    bin().arg("--gz").arg(&input).assert().success();
+
+    assert!(expected.is_file());
+    assert_has_gzip_magic(&expected);
+}
+
+#[test]
+fn pack_gz_unpack_roundtrips_bytes() {
+    let sb = Sandbox::new("pack-gz-rt");
+    let body = b"the gzip round trip\n".repeat(50);
+    let input = sb.write("payload.bin", &body);
+
+    bin().arg("--gz").arg(&input).assert().success();
+    let packed = sb.expected("payload.bin.upxz");
+    assert_has_gzip_magic(&packed);
+
+    // Unpack must restore byte-for-byte through the gzip codec path.
+    bin().arg("-d").arg(&packed).arg("-f").assert().success();
+    assert_eq!(fs::read(sb.expected("payload.bin")).unwrap(), body);
+}
+
+#[test]
+fn pack_gz_test_reports_gzip() {
+    let sb = Sandbox::new("pack-gz-test");
+    let input = sb.write("data.bin", b"abc".repeat(100).as_slice());
+    bin().arg("--gz").arg(&input).assert().success();
+    let packed = sb.expected("data.bin.upxz");
+
+    bin().arg("-t").arg(&packed).assert().success().stdout(
+        predicate::str::contains("ok\t")
+            .and(predicate::str::contains("gzip round-trip ok"))
+            .and(predicate::str::contains("data.bin")),
+    );
+}
+
+#[test]
+fn pack_gz_list_shows_gzip_codec() {
+    let sb = Sandbox::new("pack-gz-list");
+    let input = sb.write("note.txt", b"hello world\n".repeat(16).as_slice());
+    bin().arg("--gz").arg(&input).assert().success();
+    let packed = sb.expected("note.txt.upxz");
+
+    bin()
+        .arg("-l")
+        .arg(&packed)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("magic\tUPXZ").and(predicate::str::contains("codec\tgzip")));
+}
+
+#[test]
+fn pack_gz_runs_packed_script() {
+    // The runner path (upxz <file>.upxz) must dispatch on the codec byte and
+    // exec the gzip-decompressed original. We pack a shell script with --gz.
+    let sb = Sandbox::new("pack-gz-run");
+    #[cfg(unix)]
+    {
+        let script = b"#!/bin/sh\necho gz-ran; exit 0\n";
+        let input = sb.write("hello.sh", script);
+
+        bin().arg("--gz").arg(&input).assert().success();
+        let packed = sb.expected("hello.sh.upxz");
+        assert_has_gzip_magic(&packed);
+
+        let out = std::process::Command::new("target/release/upxz")
+            .arg(&packed)
+            .output()
+            .unwrap_or_else(|e| panic!("run upxz: {e}"));
+        assert!(
+            out.status.success(),
+            "upxz run exited {:?}: stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "gz-ran");
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sb;
+    }
+}
+
+#[test]
+fn backcompat_zstd_container_still_works_after_codec_aware_build() {
+    // A container packed WITHOUT --gz must still use codec id 0 (zstd) and
+    // round-trip through the new codec-aware unpacker. This is the regression
+    // guard for "did we break the v0.1/v0.2 format?".
+    let sb = Sandbox::new("backcompat");
+    let body = b"backward compat zstd bytes\n".repeat(40);
+    let input = sb.write("old.bin", &body);
+
+    bin().arg(&input).assert().success(); // no --gz => zstd
+    let packed = sb.expected("old.bin.upxz");
+    let bytes = fs::read(&packed).unwrap();
+    assert_eq!(&bytes[..5], b"UPXZ\x01");
+    assert_eq!(bytes[5], 0, "default pack must write codec id 0 (zstd)");
+
+    bin().arg("-d").arg(&packed).arg("-f").assert().success();
+    assert_eq!(fs::read(sb.expected("old.bin")).unwrap(), body);
+}
