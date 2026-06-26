@@ -13,6 +13,7 @@
 //! all Mach-O/ELF fixup, codesign and PAC entanglement — so it works on macOS,
 //! Linux, and (later) Windows with one container format.
 
+mod bin_run;
 mod format;
 mod level;
 mod sfx;
@@ -37,10 +38,21 @@ struct Cli {
     #[arg(value_name = "FILE")]
     file: PathBuf,
 
-    /// Create a self-extracting binary (SFX). `upxz -c <orig> <packed>` writes
-    /// an executable `packed` file that, when run, decompresses and execs the
-    /// original. The original is the first positional, the output is the
-    /// second.
+    /// Run a single entry from a `.tar.zst` archive **without extracting the
+    /// whole archive** (AppImage-style: archive-distributed + run inner).
+    /// `--bin <inner-path>` selects the entry to run (e.g. `bin/myapp`); the
+    /// `FILE` positional is the `.tar.zst` archive. The archive is streamed
+    /// (zstd-decoded + tar-parsed) and only the matched entry's bytes are
+    /// materialized — into a memfd on Linux, or a temp file (+ ad-hoc
+    /// codesign) on macOS — then `execve`d. Trailing args after `--` are
+    /// forwarded verbatim to the inner binary.
+    #[arg(long = "bin", value_name = "INNER_PATH")]
+    bin: Option<String>,
+
+    /// Create a self-extracting binary (SFX). `upxz -c <orig> -o <packed>`
+    /// writes an executable `packed` file that, when run, decompresses and
+    /// execs the original. The original is the `FILE` positional; the output
+    /// path is given by `-o`/`--out`.
     ///
     /// The SFX mechanism is platform-specific:
     /// - **Linux**: `packed = [stub][.upxz][trailer]`. The stub uses
@@ -55,8 +67,10 @@ struct Cli {
     #[arg(short = 'c', long = "create-sfx")]
     create_sfx: bool,
 
-    /// When used with `-c`, the output SFX path. Required iff `-c` is set.
-    #[arg(value_name = "PACKED", requires = "create_sfx")]
+    /// Output path for `-c` (the SFX file). Required when `-c` is set. Kept as
+    /// an option (not a second positional) so that `run`/`--bin` trailing args
+    /// after `--` are not swallowed by a positional slot — see `ARGS` below.
+    #[arg(short = 'o', long = "out", value_name = "PACKED", requires = "create_sfx")]
     sfx_output: Option<PathBuf>,
 
     /// Decompress / restore a .upxz container to its original file.
@@ -100,6 +114,9 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(inner) = &cli.bin {
+        return bin_run::run(&cli.file, inner, cli.quiet, &cli.trailing);
+    }
     if cli.create_sfx {
         let out = cli
             .sfx_output

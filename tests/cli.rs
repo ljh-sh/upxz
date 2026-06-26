@@ -5,6 +5,8 @@
 //!
 //! - pack  : `upxz <file>`           -> writes `<file>.upxz`
 //! - run   : `upxz <file>.upxz`      -> decompress + exec (propagates exit code)
+//! - --bin : `upxz --bin <inner> <a.tar.zst> -- args` -> stream-extract one
+//!           entry from a .tar.zst and exec it (no full extraction)
 //! - -d    : unpack, byte-for-byte round-trip
 //! - -l/-t : list / test, exit 0 + expected fields
 //! - level : `--fast`, `-z N`, default — all must produce a valid container
@@ -303,7 +305,7 @@ fn create_sfx_runs_packed_script_linux() {
         let input = sb.write("hello.sh", script);
         let packed = sb.expected("hello.packed");
 
-        bin().arg("-c").arg(&input).arg(&packed).assert().success();
+        bin().arg("-c").arg(&input).arg("-o").arg(&packed).assert().success();
 
         // The SFX must be executable.
         #[cfg(unix)]
@@ -344,7 +346,7 @@ fn create_sfx_propagates_exit_code_linux() {
         let input = sb.write("rc7.sh", script);
         let packed = sb.expected("rc7.packed");
 
-        bin().arg("-c").arg(&input).arg(&packed).assert().success();
+        bin().arg("-c").arg(&input).arg("-o").arg(&packed).assert().success();
         std::process::Command::new(&packed)
             .status()
             .expect("run SFX")
@@ -380,7 +382,7 @@ fn create_sfx_runs_packed_script_macos() {
         let input = sb.write("hello.sh", script);
         let packed = sb.expected("hello.packed");
 
-        bin().arg("-c").arg(&input).arg(&packed).assert().success();
+        bin().arg("-c").arg(&input).arg("-o").arg(&packed).assert().success();
 
         // The SFX must be executable. Its Mach-O header IS the loader
         // (codesigned), so `./packed` execs the loader directly.
@@ -420,7 +422,7 @@ fn create_sfx_propagates_exit_code_macos() {
         let input = sb.write("rc7.sh", script);
         let packed = sb.expected("rc7.packed");
 
-        bin().arg("-c").arg(&input).arg(&packed).assert().success();
+        bin().arg("-c").arg(&input).arg("-o").arg(&packed).assert().success();
         let code = std::process::Command::new(&packed)
             .status()
             .expect("run macOS SFX")
@@ -446,7 +448,7 @@ fn create_sfx_forwards_argv_macos() {
         let input = sb.write("args.sh", script);
         let packed = sb.expected("args.packed");
 
-        bin().arg("-c").arg(&input).arg(&packed).assert().success();
+        bin().arg("-c").arg(&input).arg("-o").arg(&packed).assert().success();
         let out = std::process::Command::new(&packed)
             .args(["-a", "--long", "val", "quoted arg"])
             .output()
@@ -514,6 +516,208 @@ fn run_propagates_nonzero_exit_code() {
         let packed = sb.expected("rc7.sh.upxz");
 
         bin().arg(&packed).assert().failure().code(predicate::eq(7));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sb;
+    }
+}
+
+/// `upxz <file>.upxz -- a b -c` must forward every arg after `--` to the
+/// restored binary, including hyphen-leading ones. This is a regression test
+/// for a CLI bug where a second positional (`-c`'s output) swallowed the first
+/// trailing arg; the SFX output is now `-o`/`--out`, leaving `ARGS` as the
+/// only positional after `FILE`.
+#[test]
+fn run_forwards_trailing_args_after_dash_dash() {
+    let sb = Sandbox::new("run-args");
+    #[cfg(unix)]
+    {
+        // Echo all args so we can assert they arrived verbatim.
+        let script = b"#!/bin/sh\nprintf 'argc=%d|%s\\n' \"$#\" \"$*\"\n";
+        let input = sb.write("echo.sh", script);
+        bin().arg(&input).assert().success();
+        let packed = sb.expected("echo.sh.upxz");
+
+        let out = bin()
+            .arg(&packed)
+            .arg("--")
+            .args(["first", "-flag", "with space", "--long=1"])
+            .assert()
+            .success();
+        let s = String::from_utf8_lossy(&out.get_output().stdout);
+        assert!(
+            s.contains("argc=4|"),
+            "expected 4 forwarded args, got: {s}"
+        );
+        assert!(
+            s.contains("first -flag with space --long=1"),
+            "args not forwarded verbatim: {s}"
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sb;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --bin : run a single entry out of a .tar.zst without full extraction.
+// ---------------------------------------------------------------------------
+
+/// Build a `.tar.zst` at `dst` from the files under `src_dir`. Returns early
+/// with a sentinel error message if either `tar` or `zstd` is missing on PATH
+/// (the calling test then no-ops rather than failing — the test environment is
+/// not guaranteed to ship them).
+#[cfg(unix)]
+fn build_tar_zst(src_dir: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
+    use std::process::Command;
+    // tar -cf tmp.tar -C src_dir .
+    let tmp_tar = dst.with_extension("tar");
+    let st = Command::new("tar")
+        .arg("-cf")
+        .arg(&tmp_tar)
+        .arg("-C")
+        .arg(src_dir)
+        .arg(".")
+        .status()?;
+    if !st.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("tar exited {st:?}; is tar on PATH?"),
+        ));
+    }
+    // zstd -19 -f tmp.tar -o dst
+    let st = Command::new("zstd")
+        .args(["-19", "-f"])
+        .arg(&tmp_tar)
+        .arg("-o")
+        .arg(dst)
+        .status()?;
+    if !st.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("zstd exited {st:?}; is zstd on PATH?"),
+        ));
+    }
+    let _ = fs::remove_file(&tmp_tar);
+    Ok(())
+}
+
+/// `upxz --bin bin/hello a.tar.zst -- arg1` runs only the `bin/hello` entry,
+/// forwards the trailing args, and propagates the inner exit code. The decoy
+/// files in the archive are never extracted.
+#[test]
+fn bin_runs_inner_entry_and_forwards_argv() {
+    let sb = Sandbox::new("bin-run");
+    #[cfg(unix)]
+    {
+        // Build a small archive with:
+        //   bin/hello  -> the script we want to run (exits 42, prints argv)
+        //   extra/x    -> a decoy that must NOT be extracted
+        let src = sb.dir.join("src");
+        fs::create_dir_all(src.join("bin")).unwrap();
+        fs::create_dir_all(src.join("extra")).unwrap();
+        let script = b"#!/bin/sh\nprintf 'argc=%d|%s\\n' \"$#\" \"$*\"; exit 42\n";
+        fs::write(src.join("bin").join("hello"), script).unwrap();
+        fs::write(src.join("extra").join("decoy"), b"decoy").unwrap();
+
+        let archive = sb.dir.join("a.tar.zst");
+        if build_tar_zst(&src, &archive).is_err() {
+            // No tar/zstd on PATH in this environment — skip, not fail.
+            eprintln!("skipping bin_runs_inner_entry_and_forwards_argv: tar/zstd unavailable");
+            return;
+        }
+        assert!(archive.is_file(), "archive should exist");
+
+        // Run only the inner entry, with trailing args.
+        let out = bin()
+            .arg("--bin")
+            .arg("bin/hello")
+            .arg(&archive)
+            .arg("--")
+            .args(["one", "two", "-x"])
+            .assert()
+            .failure()
+            .code(predicate::eq(42));
+        let s = String::from_utf8_lossy(&out.get_output().stdout);
+        assert!(
+            s.contains("argc=3|"),
+            "expected 3 forwarded args, got: {s}"
+        );
+        assert!(
+            s.contains("one two -x"),
+            "argv not forwarded verbatim: {s}"
+        );
+
+        // The decoy must not have been written next to the archive (we only
+        // materialize the matched inner entry, into a temp / memfd).
+        assert!(
+            !sb.dir.join("extra").exists(),
+            "decoy dir was created — --bin should not extract unrelated entries"
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sb;
+    }
+}
+
+/// `--bin ./bin/hello` (leading `./`) must match an entry stored as `bin/hello`.
+#[test]
+fn bin_matches_entry_with_leading_dot_slash() {
+    let sb = Sandbox::new("bin-dot");
+    #[cfg(unix)]
+    {
+        let src = sb.dir.join("src");
+        fs::create_dir_all(src.join("bin")).unwrap();
+        fs::write(
+            src.join("bin").join("hi"),
+            b"#!/bin/sh\necho ran-inner\n",
+        )
+        .unwrap();
+        let archive = sb.dir.join("b.tar.zst");
+        if build_tar_zst(&src, &archive).is_err() {
+            eprintln!("skipping bin_matches_entry_with_leading_dot_slash: tar/zstd unavailable");
+            return;
+        }
+
+        bin()
+            .arg("--bin")
+            .arg("./bin/hi")
+            .arg(&archive)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("ran-inner"));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sb;
+    }
+}
+
+/// `--bin` on a path that is not in the archive must error, not silently exit 0.
+#[test]
+fn bin_missing_entry_errors() {
+    let sb = Sandbox::new("bin-missing");
+    #[cfg(unix)]
+    {
+        let src = sb.dir.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("real"), b"#!/bin/sh\necho x\n").unwrap();
+        let archive = sb.dir.join("c.tar.zst");
+        if build_tar_zst(&src, &archive).is_err() {
+            eprintln!("skipping bin_missing_entry_errors: tar/zstd unavailable");
+            return;
+        }
+
+        bin()
+            .arg("--bin")
+            .arg("does/not/exist")
+            .arg(&archive)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("did not find entry"));
     }
     #[cfg(not(unix))]
     {
