@@ -72,10 +72,14 @@ See [`DESIGN.md`](DESIGN.md) for the full rationale.
 
 ## Self-extracting binaries (`-c` / `--create-sfx`)
 
-`upxz -c <orig> <packed>` produces a **self-extracting executable**: a single
+`upxz -c <orig> -o <packed>` produces a **self-extracting executable**: a single
 `packed` file you can `chmod +x` and run directly. Running it decompresses the
 original and execs it with the original name as `argv[0]` and all trailing
 args forwarded verbatim; the inner program's exit code is propagated.
+
+> The SFX output path is given by `-o`/`--out` (not a second positional), so
+> that the trailing-args form `upxz foo.upxz -- -a -b` works unambiguously for
+> the runner.
 
 The SFX mechanism is platform-specific:
 
@@ -86,7 +90,7 @@ memory file and `fexecve`s it — **no temp file is ever written to disk**.
 
 ```bash
 # build an SFX (Linux)
-upxz -c /usr/local/bin/myapp ./myapp.sfx
+upxz -c /usr/local/bin/myapp -o ./myapp.sfx
 
 # run it — argv and exit code are transparent
 ./myapp.sfx --flag value    # forwards --flag value to myapp
@@ -131,7 +135,7 @@ SIGKILLs an unsigned restored copy on exec), and `execv`s it.
 
 ```bash
 # build an SFX (macOS)
-upxz -c /usr/local/bin/myapp ./myapp.sfx
+upxz -c /usr/local/bin/myapp -o ./myapp.sfx
 ./myapp.sfx --flag value    # forwards --flag value to myapp
 echo $?                     # myapp's exit code
 ```
@@ -143,6 +147,30 @@ loader triggers AMFI SIGKILL on the exec'd program). These files are harmless
 
 This feature is `#[cfg(target_os = "linux")]` / `#[cfg(target_os = "macos")]`.
 Windows keeps the runner model (decompress to a temp file, exec).
+
+## Run a single entry from a `.tar.zst` (`--bin`)
+
+`upxz --bin <inner-path> <archive.tar.zst> [-- args...]` runs **one designated
+binary** from a `.tar.zst` archive **without extracting the whole archive**.
+This is AppImage-style distribution: the archive is the distribution unit, and
+upxz streams it (zstd-decode → tar-parse) and materializes only the matched
+entry — into a `memfd` on Linux (never touches disk) or a temp file + ad-hoc
+codesign on macOS — then `execve`s it. All other entries are read and
+discarded; they are never written to disk.
+
+```bash
+# archive layout: bin/myapp, lib/..., share/...
+upxz --bin bin/myapp app.tar.zst -- --flag value
+#  -> runs bin/myapp with argv = [--flag value], forwards exit code
+
+# leading "./" on the inner path is normalized, so this is equivalent:
+upxz --bin ./bin/myapp app.tar.zst
+```
+
+`argv[0]` of the inner process is the inner binary's basename; everything after
+`--` is forwarded verbatim (including hyphen-leading flags). On Linux the
+binary lives only in memory; on macOS it is written to `$TMPDIR`, ad-hoc
+codesigned, and removed after the child exits.
 
 ## Container format
 
