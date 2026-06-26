@@ -43,3 +43,22 @@ pub fn macos_loader_bytes() -> Option<&'static [u8]> {
         Some(bytes)
     }
 }
+
+/// Return the embedded Windows stub bytes (`upxz-winstub.exe`), or `None`
+/// when upxz was not built on/for Windows. The Windows SFX layout mirrors the
+/// Linux stub (`[stub][.upxz][trailer: u64 stub_size BE]`); the stub writes
+/// the restored PE to `%TEMP%` and `CreateProcessW`s it. Windows has no
+/// portable in-memory exec — the NT-section route is documented but not
+/// compiled; see `winstub/src/main.rs` module docs.
+///
+/// Only called from the Windows SFX packer (`pack_sfx_windows`); on other
+/// targets the function is dead code, hence the allow.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn windows_stub_bytes() -> Option<&'static [u8]> {
+    let bytes: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/upxz-winstub.bin"));
+    if bytes.is_empty() {
+        None
+    } else {
+        Some(bytes)
+    }
+}

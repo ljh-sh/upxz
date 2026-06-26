@@ -67,6 +67,11 @@ struct Cli {
     ///   to a temp file and execs it (macOS has no in-memory exec). The
     ///   appended app bytes break `codesign --verify --strict`, but exec is
     ///   unaffected (AMFI accepts the loader's cdhash).
+    /// - **Windows**: `packed = [stub][.upxz][trailer]`, same shape as Linux.
+    ///   The Windows stub writes the restored PE to `%TEMP%` and
+    ///   `CreateProcessW`s it (Windows has no portable in-memory exec; the
+    ///   NT-section route is documented in mneme `docs/upxz/windows.md` but not
+    ///   compiled). No ad-hoc code-signing is needed on Windows.
     #[arg(short = 'c', long = "create-sfx")]
     create_sfx: bool,
 
@@ -332,6 +337,14 @@ fn run(file: &Path, quiet: bool, trailing: &[String]) -> Result<()> {
 ///   re-signs it, and `execv`s it. macOS has no in-memory exec. The appended
 ///   app bytes make `codesign --verify --strict` fail, but exec is unaffected
 ///   (AMFI accepts the loader's cdhash).
+/// - **Windows** (`pack_sfx_windows`): `[ stub ][ .upxz container ][ trailer: u64 stub_size BE ]`.
+///   Same shape as the Linux stub. The Windows stub (`upxz-winstub`) writes
+///   the restored PE to `%TEMP%\upxz-<pid>-<tag>-<stem>.exe` and
+///   `CreateProcessW`s it, then removes the temp file after the child exits.
+///   Windows has no portable in-memory exec; the NT-section route is
+///   documented (mneme `docs/upxz/windows.md`) but not compiled — see
+///   `winstub/src/main.rs`. Windows does NOT require ad-hoc code-signing for
+///   a local exec (unlike macOS AMFI), so no re-sign step.
 ///
 /// On other targets `pack_sfx` refuses with an explicit error rather than
 /// producing a non-functional artifact.
@@ -406,7 +419,20 @@ fn pack_sfx(
             &payload,
         )
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        pack_sfx_windows(
+            input,
+            output,
+            codec,
+            lvl,
+            quiet,
+            &raw,
+            &header_bytes,
+            &payload,
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = (
             input,
@@ -418,7 +444,7 @@ fn pack_sfx(
             &header_bytes,
             &payload,
         );
-        bail!("upxz -c (SFX) is only supported on Linux and macOS; rebuild upxz on the target platform");
+        bail!("upxz -c (SFX) is only supported on Linux, macOS, and Windows; rebuild upxz on the target platform");
     }
 }
 
@@ -559,6 +585,83 @@ fn pack_sfx_macos(
             raw.len(),
             total,
             loader.len(),
+            payload.len(),
+            codec.name(),
+            level
+        );
+    }
+    Ok(())
+}
+
+/// Windows SFX: `[ stub ][ .upxz container ][ trailer: u64 stub_size BE ]`.
+///
+/// The layout mirrors the Linux stub exactly (a single stub segment followed
+/// by the `.upxz` container and an 8-byte big-endian `stub_size` trailer).
+/// The Windows stub (`upxz-winstub`) resolves its own path via
+/// `GetModuleFileNameW`, reads the trailer, slices the `.upxz` out,
+/// decompresses it (zstd or gzip per the codec byte), writes the restored PE
+/// to `%TEMP%\upxz-<pid>-<tag>-<stem>.exe`, `CreateProcessW`s it with argv
+/// forwarded verbatim, and removes the temp file after the child exits. See
+/// `winstub/src/main.rs` for why the NT-section in-memory route is documented
+/// but not compiled.
+///
+/// Unlike macOS, Windows does NOT require ad-hoc code-signing for a local
+/// exec, so there is no re-sign step here. (Windows Defender / SmartScreen may
+/// prompt on first run of an unknown .exe — that is host-level behaviour, not
+/// something upxz can or should bypass.)
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)] // 8 args: all are distinct inputs the SFX layout needs.
+fn pack_sfx_windows(
+    input: &Path,
+    output: &Path,
+    codec: Codec,
+    level: i32,
+    quiet: bool,
+    raw: &[u8],
+    header_bytes: &[u8],
+    payload: &[u8],
+) -> Result<()> {
+    let stub = sfx::windows_stub_bytes().ok_or_else(|| {
+        anyhow::anyhow!("upxz was not built with the Windows SFX stub; rebuild on Windows")
+    })?;
+    ensure!(
+        !stub.is_empty(),
+        "upxz-winstub artifact is empty; the SFX stub did not build correctly"
+    );
+
+    let stub_size = u64::try_from(stub.len()).context("stub too large to address")?;
+    let mut out = fs::File::create(output)
+        .with_context(|| format!("cannot create output {}", output.display()))?;
+    out.write_all(stub)
+        .with_context(|| format!("cannot write stub to {}", output.display()))?;
+    out.write_all(header_bytes)
+        .with_context(|| format!("cannot write header to {}", output.display()))?;
+    out.write_all(payload)
+        .with_context(|| format!("cannot write payload to {}", output.display()))?;
+    out.write_all(&stub_size.to_be_bytes())
+        .with_context(|| format!("cannot write trailer to {}", output.display()))?;
+    out.flush()?;
+
+    // Mark the output executable. On Windows the executable bit is implicit
+    // for `.exe` files, but we set it anyway so a copied `.exe` retains the
+    // bit on filesystems that track it. The packed output should be named with
+    // a `.exe` suffix by the caller; we do not enforce the extension here.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(output, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("cannot chmod output {}", output.display()))?;
+    }
+
+    if !quiet {
+        let total = stub.len() + header_bytes.len() + payload.len() + 8;
+        eprintln!(
+            "sfx {} -> {} ({} -> {} bytes; stub {}, payload {}, {} {})",
+            input.display(),
+            output.display(),
+            raw.len(),
+            total,
+            stub.len(),
             payload.len(),
             codec.name(),
             level
