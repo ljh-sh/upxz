@@ -4,9 +4,10 @@
 //!   and copy its binary into `OUT_DIR/upxz-stub.bin`. Embedded by
 //!   `src/sfx.rs::stub_bytes()`.
 //! - **macOS**: build the standalone `upxz-loader` crate (`loader/`, no_std +
-//!   zstd-sys FFI) and copy both its binary and the `boot/upxz-boot.sh` boot
-//!   script into `OUT_DIR`. The macOS SFX is three-segment
-//!   `[boot][loader][.upxz][trailer]`; embedded by `src/sfx.rs::macos_bytes()`.
+//!   zstd-sys FFI) and copy its binary into `OUT_DIR/upxz-loader.bin`. The
+//!   macOS SFX is two-segment `[loader][.upxz][trailer]`; the loader binary is
+//!   the packed file's Mach-O header. Embedded by
+//!   `src/sfx.rs::macos_loader_bytes()`.
 //! - **Other targets**: emit empty placeholders so `include_bytes!` still
 //!   compiles, and `upxz -c` refuses with a clear message at runtime.
 //!
@@ -23,7 +24,7 @@
 //! profile apply.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -42,10 +43,9 @@ fn main() {
 }
 
 /// Linux: build `upxz-stub` (workspace member) and copy its binary into
-/// `OUT_DIR/upxz-stub.bin`. Leaves the macOS placeholders empty.
-fn build_linux_stub(out_dir: &PathBuf) {
+/// `OUT_DIR/upxz-stub.bin`. Leaves the macOS loader placeholder empty.
+fn build_linux_stub(out_dir: &Path) {
     let stub_path = out_dir.join("upxz-stub.bin");
-    let boot_path = out_dir.join("upxz-boot.sh");
     let loader_path = out_dir.join("upxz-loader.bin");
 
     // Build the stub as a release artifact targeting the host triple. We pin
@@ -86,9 +86,8 @@ fn build_linux_stub(out_dir: &PathBuf) {
         std::fs::copy(&artifact, &stub_path).expect("copy stub to OUT_DIR");
     }
 
-    // Empty placeholders for the macOS pieces so `include_bytes!` compiles on
-    // every target. `macos_bytes()` returns None when these are empty.
-    std::fs::write(&boot_path, b"").expect("write empty boot placeholder");
+    // Empty placeholder for the macOS loader so `include_bytes!` compiles on
+    // every target. `macos_loader_bytes()` returns None when this is empty.
     std::fs::write(&loader_path, b"").expect("write empty loader placeholder");
 
     println!("cargo:rerun-if-changed=stub/src/main.rs");
@@ -96,11 +95,10 @@ fn build_linux_stub(out_dir: &PathBuf) {
     println!("cargo:rerun-if-changed={}", artifact.display());
 }
 
-/// macOS: build the standalone `upxz-loader` crate and copy its binary plus
-/// the boot sh script into `OUT_DIR`. Leaves the Linux stub placeholder empty.
-fn build_macos_pieces(out_dir: &PathBuf) {
+/// macOS: build the standalone `upxz-loader` crate and copy its binary into
+/// `OUT_DIR`. Leaves the Linux stub placeholder empty.
+fn build_macos_pieces(out_dir: &Path) {
     let stub_path = out_dir.join("upxz-stub.bin");
-    let boot_path = out_dir.join("upxz-boot.sh");
     let loader_path = out_dir.join("upxz-loader.bin");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -134,25 +132,19 @@ fn build_macos_pieces(out_dir: &PathBuf) {
     }
     std::fs::copy(&artifact, &loader_path).expect("copy loader to OUT_DIR");
 
-    // Copy the boot sh script verbatim.
-    let boot_src = manifest_dir.join("boot").join("upxz-boot.sh");
-    std::fs::copy(&boot_src, &boot_path).expect("copy boot.sh to OUT_DIR");
-
     // Empty placeholder for the Linux stub so `include_bytes!` compiles.
     std::fs::write(&stub_path, b"").expect("write empty stub placeholder");
 
     println!("cargo:rerun-if-changed=loader/src/main.rs");
     println!("cargo:rerun-if-changed=loader/Cargo.toml");
-    println!("cargo:rerun-if-changed=boot/upxz-boot.sh");
     println!("cargo:rerun-if-changed={}", artifact.display());
 }
 
-/// Non-Linux/non-macOS targets: emit empty placeholders for all three pieces
-/// so `include_bytes!` still compiles. `stub_bytes()` and `macos_bytes()` both
-/// return `None`, and `upxz -c` refuses with a clear runtime message.
-fn emit_empty_placeholders(out_dir: &PathBuf) {
+/// Non-Linux/non-macOS targets: emit empty placeholders for both pieces so
+/// `include_bytes!` still compiles. `stub_bytes()` and `macos_loader_bytes()`
+/// both return `None`, and `upxz -c` refuses with a clear runtime message.
+fn emit_empty_placeholders(out_dir: &Path) {
     std::fs::write(out_dir.join("upxz-stub.bin"), b"").expect("write empty stub placeholder");
-    std::fs::write(out_dir.join("upxz-boot.sh"), b"").expect("write empty boot placeholder");
     std::fs::write(out_dir.join("upxz-loader.bin"), b"").expect("write empty loader placeholder");
 }
 

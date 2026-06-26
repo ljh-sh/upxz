@@ -362,12 +362,13 @@ fn create_sfx_propagates_exit_code_linux() {
 }
 
 // ---------------------------------------------------------------------------
-// -c create SFX (macOS only): the three-segment self-extractor
-//   `[ boot sh ][ upxz-loader ][ .upxz ][ trailer ]`. The packed file is a
-//   shell script (the boot segment) and runs unsigned; boot extracts the
-//   loader to a cache dir and execs it, which decompresses and execs the
-//   original. These tests pack a shell script as the app so they are
-//   architecture-independent inside the macOS host.
+// -c create SFX (macOS only): the two-segment self-extractor
+//   `[ upxz-loader ][ .upxz ][ trailer ]`. The loader Mach-O IS the packed
+//   file's header (codesigned); `./packed` execs the loader directly, which
+//   decompresses the app segment and execs the original. The appended app
+//   bytes break `codesign --verify --strict` but exec is unaffected (AMFI
+//   accepts the loader's cdhash). These tests pack a shell script as the app
+//   so they are architecture-independent inside the macOS host.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -381,8 +382,8 @@ fn create_sfx_runs_packed_script_macos() {
 
         bin().arg("-c").arg(&input).arg(&packed).assert().success();
 
-        // The SFX must be executable and must be a shell script (boot segment
-        // first), so it runs unsigned.
+        // The SFX must be executable. Its Mach-O header IS the loader
+        // (codesigned), so `./packed` execs the loader directly.
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&packed).unwrap().permissions().mode();

@@ -44,6 +44,7 @@ const TRAILER_LEN: usize = 8;
 ///   - On kernels older than 6.3 the `MFD_EXEC` flag is unknown and
 ///     `memfd_create` returns `EINVAL`; we retry with flags=0 (those kernels
 ///     default memfds to executable, which is what we want).
+///
 /// See `memfd_create(2)` and `Documentation/userspace-api/mfd_noexec.rst`.
 const MFD_EXEC: u32 = 0x0010;
 
@@ -136,17 +137,15 @@ fn run() -> Result<(), String> {
     let payload = &upxz[payload_start..];
 
     // 5. Decompress. The payload is a raw zstd frame of the original file.
-    let original = zstd::decode_all(payload)
-        .map_err(|e| format!("zstd decompression failed: {e}"))?;
+    let original =
+        zstd::decode_all(payload).map_err(|e| format!("zstd decompression failed: {e}"))?;
 
     // 6. memfd_create + write + fexecve. We request MFD_EXEC so the memfd is
     //    executable on hardened kernels (vm.memfd_noexec). We do NOT set
     //    MFD_CLOEXEC because it breaks `#!script` exec from a memfd (the
     //    kernel cannot re-open a close-on-exec memfd to pass it to the
     //    script interpreter). See `create_exec_memfd` for the full rationale.
-    let fd = create_exec_memfd().map_err(|errno| {
-        format!("memfd_create failed (errno {errno})")
-    })?;
+    let fd = create_exec_memfd().map_err(|errno| format!("memfd_create failed (errno {errno})"))?;
 
     // Write the original bytes. write() may be partial, so loop.
     let mut written = 0usize;
@@ -169,15 +168,9 @@ fn run() -> Result<(), String> {
 
     // 7. Build argv[0] = stored name, forward argv[1..] verbatim.
     let mut argv: Vec<std::ffi::CString> = Vec::with_capacity(std::env::args().len());
-    argv.push(
-        std::ffi::CString::new(name)
-            .map_err(|_| "stored name contains an interior NUL")?,
-    );
+    argv.push(std::ffi::CString::new(name).map_err(|_| "stored name contains an interior NUL")?);
     for a in std::env::args().skip(1) {
-        argv.push(
-            std::ffi::CString::new(a)
-                .map_err(|_| "an argument contains an interior NUL")?,
-        );
+        argv.push(std::ffi::CString::new(a).map_err(|_| "an argument contains an interior NUL")?);
     }
     let argv_ptrs: Vec<*const libc::c_char> = argv
         .iter()
@@ -203,13 +196,7 @@ fn run() -> Result<(), String> {
 
     // fexecve replaces this process image. On success it does not return.
     // Signature: fexecve(fd, argv: *const *const c_char, envp: *const *const c_char).
-    let rc = unsafe {
-        libc::fexecve(
-            fd,
-            argv_ptrs.as_ptr(),
-            env_ptrs.as_ptr(),
-        )
-    };
+    let rc = unsafe { libc::fexecve(fd, argv_ptrs.as_ptr(), env_ptrs.as_ptr()) };
     let _ = rc; // always < 0 if we reach here
     Err(format!(
         "fexecve failed (errno {})",

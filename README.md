@@ -104,29 +104,30 @@ trailing 8 bytes, slices out the `.upxz` container, decompresses, and execs.
 It is compiled and embedded into `upxz` at build time by `build.rs`, so
 `upxz -c` needs no separate artifact on disk.
 
-### macOS — three-segment SFX (boot + loader)
+### macOS — two-segment SFX (loader + app)
 
-macOS has no `memfd_create` / in-memory exec, so the SFX is three segments:
-
-```
-[ boot sh script ][ upxz-loader ][ .upxz container ][ trailer ]
-```
-
-The trailer (last 20 bytes) records each segment's length so boot and loader
-can locate their own slice:
+macOS has no `memfd_create` / in-memory exec, so the SFX is two segments:
 
 ```
-b"UPXZEND1" (8) + boot_len (u32 BE) + loader_len (u32 BE) + app_len (u32 BE)
+[ upxz-loader Mach-O (codesigned) ][ .upxz container ][ trailer ]
 ```
 
-Running `./packed` executes the boot script via its shebang — the kernel runs
-`/bin/sh` on the file, so **the packed file itself is not codesigned** (it is
-treated as a shell script, not a Mach-O). Boot extracts the embedded
-`upxz-loader` to `~/.cache/upxz/upxz-loader-<len>` (reused across invocations),
-ad-hoc signs it, and execs it. The loader (a `#![no_std]` binary, ~84 KB)
-reads the same trailer, slices out the `.upxz` app segment, zstd-decompresses
-it, writes the restored binary to `/tmp/upxz-app-<pid>`, ad-hoc re-signs it
-(macOS AMFI SIGKILLs an unsigned restored copy on exec), and `execv`s it.
+The trailer (last 16 bytes) records each segment's length so the loader can
+locate its own slice:
+
+```
+b"UPXZEND1" (8) + loader_len (u32 BE) + app_len (u32 BE)
+```
+
+Running `./packed` executes the loader directly — the packed file's Mach-O
+header IS the loader (codesigned). The kernel reads the `mach_header` at
+offset 0 and AMFI accepts the loader's cdhash. The appended app bytes make
+`codesign --verify --strict` fail (the file's integrity is perturbed), but
+**exec is unaffected**. The loader (a `#![no_std]` binary, ~84 KB) resolves
+its own path via `_NSGetExecutablePath`, reads the trailer, slices out the
+`.upxz` app segment at offset `loader_len`, zstd-decompresses it, writes the
+restored binary to `/tmp/upxz-app-<pid>`, ad-hoc re-signs it (macOS AMFI
+SIGKILLs an unsigned restored copy on exec), and `execv`s it.
 
 ```bash
 # build an SFX (macOS)
