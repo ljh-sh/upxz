@@ -224,9 +224,7 @@ fn exec_memfd_linux(name: &str, bytes: &[u8], trailing: &[String]) -> Result<()>
     };
     let err2 = std::io::Error::last_os_error();
     let _ = rc2;
-    bail!(
-        "fexecve failed ({err}); /proc/self/fd fallback also failed ({err2})"
-    );
+    bail!("fexecve failed ({err}); /proc/self/fd fallback also failed ({err2})");
 }
 
 // ---------------------------------------------------------------------------

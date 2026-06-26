@@ -73,7 +73,12 @@ struct Cli {
     /// Output path for `-c` (the SFX file). Required when `-c` is set. Kept as
     /// an option (not a second positional) so that `run`/`--bin` trailing args
     /// after `--` are not swallowed by a positional slot — see `ARGS` below.
-    #[arg(short = 'o', long = "out", value_name = "PACKED", requires = "create_sfx")]
+    #[arg(
+        short = 'o',
+        long = "out",
+        value_name = "PACKED",
+        requires = "create_sfx"
+    )]
     sfx_output: Option<PathBuf>,
 
     /// Decompress / restore a .upxz container to its original file.
@@ -182,8 +187,8 @@ fn pack(input: &Path, level: &LevelArgs, force: bool, quiet: bool) -> Result<()>
         Codec::Zstd => level.resolve(),
         Codec::Gzip => level.gzip_level() as i32,
     };
-    let payload =
-        compress::compress(codec, &raw, lvl).with_context(|| format!("{codec} compression failed"))?;
+    let payload = compress::compress(codec, &raw, lvl)
+        .with_context(|| format!("{codec} compression failed"))?;
 
     let out_path = default_pack_output(input);
     if out_path.exists() && !force {
@@ -192,11 +197,7 @@ fn pack(input: &Path, level: &LevelArgs, force: bool, quiet: bool) -> Result<()>
             out_path.display()
         );
     }
-    let header_bytes = Header {
-        name,
-        codec,
-    }
-    .encode();
+    let header_bytes = Header { name, codec }.encode();
     let mut out = fs::File::create(&out_path)
         .with_context(|| format!("cannot create output {}", out_path.display()))?;
     out.write_all(&header_bytes)
@@ -350,8 +351,8 @@ fn pack_sfx(
         Codec::Zstd => level.resolve(),
         Codec::Gzip => level.gzip_level() as i32,
     };
-    let payload =
-        compress::compress(codec, raw.as_slice(), lvl).with_context(|| format!("{codec} compression failed"))?;
+    let payload = compress::compress(codec, raw.as_slice(), lvl)
+        .with_context(|| format!("{codec} compression failed"))?;
     let header_bytes = Header {
         name: name.clone(),
         codec,
@@ -567,8 +568,8 @@ fn pack_sfx_macos(
 fn list(file: &Path) -> Result<()> {
     let buf = read_input_file(file)?;
     let (header, payload_offset) = parse_header(&buf)?;
-    let original =
-        compress::decompress(header.codec, &buf[payload_offset..]).context("decompression failed while listing")?;
+    let original = compress::decompress(header.codec, &buf[payload_offset..])
+        .context("decompression failed while listing")?;
     let ratio = if original.is_empty() {
         0.0
     } else {
@@ -587,7 +588,8 @@ fn list(file: &Path) -> Result<()> {
 fn test(file: &Path) -> Result<()> {
     let buf = read_input_file(file)?;
     let (header, payload_offset) = parse_header(&buf)?;
-    compress::decompress(header.codec, &buf[payload_offset..]).context("decompression test failed")?;
+    compress::decompress(header.codec, &buf[payload_offset..])
+        .context("decompression test failed")?;
     println!(
         "ok\t{} (magic valid, {} round-trip ok, original name {})",
         file.display(),

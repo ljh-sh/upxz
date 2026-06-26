@@ -165,8 +165,9 @@ fn run() -> Result<(), String> {
     //    stub; the stub is a normal std binary with no size gate, so unlike the
     //    macOS no_std loader it can carry both decoders.
     let original = match codec_byte {
-        CODEC_ZSTD => zstd::decode_all(payload)
-            .map_err(|e| format!("zstd decompression failed: {e}"))?,
+        CODEC_ZSTD => {
+            zstd::decode_all(payload).map_err(|e| format!("zstd decompression failed: {e}"))?
+        }
         CODEC_GZIP => {
             let mut dec = flate2::read::GzDecoder::new(payload);
             let mut out = Vec::new();

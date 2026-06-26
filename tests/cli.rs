@@ -305,7 +305,13 @@ fn create_sfx_runs_packed_script_linux() {
         let input = sb.write("hello.sh", script);
         let packed = sb.expected("hello.packed");
 
-        bin().arg("-c").arg(&input).arg("-o").arg(&packed).assert().success();
+        bin()
+            .arg("-c")
+            .arg(&input)
+            .arg("-o")
+            .arg(&packed)
+            .assert()
+            .success();
 
         // The SFX must be executable.
         #[cfg(unix)]
@@ -346,7 +352,13 @@ fn create_sfx_propagates_exit_code_linux() {
         let input = sb.write("rc7.sh", script);
         let packed = sb.expected("rc7.packed");
 
-        bin().arg("-c").arg(&input).arg("-o").arg(&packed).assert().success();
+        bin()
+            .arg("-c")
+            .arg(&input)
+            .arg("-o")
+            .arg(&packed)
+            .assert()
+            .success();
         std::process::Command::new(&packed)
             .status()
             .expect("run SFX")
@@ -382,7 +394,13 @@ fn create_sfx_runs_packed_script_macos() {
         let input = sb.write("hello.sh", script);
         let packed = sb.expected("hello.packed");
 
-        bin().arg("-c").arg(&input).arg("-o").arg(&packed).assert().success();
+        bin()
+            .arg("-c")
+            .arg(&input)
+            .arg("-o")
+            .arg(&packed)
+            .assert()
+            .success();
 
         // The SFX must be executable. Its Mach-O header IS the loader
         // (codesigned), so `./packed` execs the loader directly.
@@ -422,7 +440,13 @@ fn create_sfx_propagates_exit_code_macos() {
         let input = sb.write("rc7.sh", script);
         let packed = sb.expected("rc7.packed");
 
-        bin().arg("-c").arg(&input).arg("-o").arg(&packed).assert().success();
+        bin()
+            .arg("-c")
+            .arg(&input)
+            .arg("-o")
+            .arg(&packed)
+            .assert()
+            .success();
         let code = std::process::Command::new(&packed)
             .status()
             .expect("run macOS SFX")
@@ -448,7 +472,13 @@ fn create_sfx_forwards_argv_macos() {
         let input = sb.write("args.sh", script);
         let packed = sb.expected("args.packed");
 
-        bin().arg("-c").arg(&input).arg("-o").arg(&packed).assert().success();
+        bin()
+            .arg("-c")
+            .arg(&input)
+            .arg("-o")
+            .arg(&packed)
+            .assert()
+            .success();
         let out = std::process::Command::new(&packed)
             .args(["-a", "--long", "val", "quoted arg"])
             .output()
@@ -546,10 +576,7 @@ fn run_forwards_trailing_args_after_dash_dash() {
             .assert()
             .success();
         let s = String::from_utf8_lossy(&out.get_output().stdout);
-        assert!(
-            s.contains("argc=4|"),
-            "expected 4 forwarded args, got: {s}"
-        );
+        assert!(s.contains("argc=4|"), "expected 4 forwarded args, got: {s}");
         assert!(
             s.contains("first -flag with space --long=1"),
             "args not forwarded verbatim: {s}"
@@ -641,14 +668,8 @@ fn bin_runs_inner_entry_and_forwards_argv() {
             .failure()
             .code(predicate::eq(42));
         let s = String::from_utf8_lossy(&out.get_output().stdout);
-        assert!(
-            s.contains("argc=3|"),
-            "expected 3 forwarded args, got: {s}"
-        );
-        assert!(
-            s.contains("one two -x"),
-            "argv not forwarded verbatim: {s}"
-        );
+        assert!(s.contains("argc=3|"), "expected 3 forwarded args, got: {s}");
+        assert!(s.contains("one two -x"), "argv not forwarded verbatim: {s}");
 
         // The decoy must not have been written next to the archive (we only
         // materialize the matched inner entry, into a temp / memfd).
@@ -671,11 +692,7 @@ fn bin_matches_entry_with_leading_dot_slash() {
     {
         let src = sb.dir.join("src");
         fs::create_dir_all(src.join("bin")).unwrap();
-        fs::write(
-            src.join("bin").join("hi"),
-            b"#!/bin/sh\necho ran-inner\n",
-        )
-        .unwrap();
+        fs::write(src.join("bin").join("hi"), b"#!/bin/sh\necho ran-inner\n").unwrap();
         let archive = sb.dir.join("b.tar.zst");
         if build_tar_zst(&src, &archive).is_err() {
             eprintln!("skipping bin_matches_entry_with_leading_dot_slash: tar/zstd unavailable");
@@ -735,7 +752,12 @@ fn assert_has_gzip_magic(path: &PathBuf) {
     let bytes = fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     assert!(bytes.len() >= 8, "{} too small", path.display());
     assert_eq!(&bytes[..5], b"UPXZ\x01", "magic prefix wrong");
-    assert_eq!(bytes[5], 1, "codec byte must be 1 (gzip) in {}", path.display());
+    assert_eq!(
+        bytes[5],
+        1,
+        "codec byte must be 1 (gzip) in {}",
+        path.display()
+    );
     assert_eq!(bytes[6], 0, "reserved byte 6 must be 0");
     assert_eq!(bytes[7], 0, "reserved byte 7 must be 0");
 }
@@ -788,12 +810,9 @@ fn pack_gz_list_shows_gzip_codec() {
     bin().arg("--gz").arg(&input).assert().success();
     let packed = sb.expected("note.txt.upxz");
 
-    bin()
-        .arg("-l")
-        .arg(&packed)
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("magic\tUPXZ").and(predicate::str::contains("codec\tgzip")));
+    bin().arg("-l").arg(&packed).assert().success().stdout(
+        predicate::str::contains("magic\tUPXZ").and(predicate::str::contains("codec\tgzip")),
+    );
 }
 
 #[test]

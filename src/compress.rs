@@ -50,8 +50,9 @@ pub fn compress(codec: Codec, raw: &[u8], level: i32) -> Result<Vec<u8>> {
 /// exactly the compressed bytes (header already stripped by the caller).
 pub fn decompress(codec: Codec, payload: &[u8]) -> Result<Vec<u8>> {
     match codec {
-        Codec::Zstd => zstd::decode_all(payload)
-            .context("zstd decompression failed; container may be corrupt"),
+        Codec::Zstd => {
+            zstd::decode_all(payload).context("zstd decompression failed; container may be corrupt")
+        }
         Codec::Gzip => {
             let mut dec = flate2::read::GzDecoder::new(payload);
             let mut out = Vec::new();
