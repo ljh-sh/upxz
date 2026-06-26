@@ -1,0 +1,33 @@
+[package]
+name = "upxz-winstub"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Windows SFX stub for upxz: reads a .upxz trailer from its own image, decompresses the original, and execs it via a temp file + CreateProcessW."
+publish = false
+
+[[bin]]
+name = "upxz-winstub"
+path = "src/main.rs"
+
+[dependencies]
+# Codec backends: zstd + gzip (flate2/miniz_oxide). Same set the Linux stub
+# uses — the stub is a normal std binary with no size gate, so it can carry
+# both decoders and dispatch on the codec byte in the .upxz magic.
+zstd = "0.13"
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+
+# Windows-only: only the Win32 surface the temp-file + exec path needs today
+# (Foundation, Storage, LibraryLoader for GetModuleFileNameW). The optional
+# in-memory NT-section route (NtCreateSection / NtMapViewOfSection /
+# NtCreateProcessEx) is NOT compiled yet — see src/main.rs module docs — so we
+# do not pull the `Wdk_*` features here. They will be added when that route is
+# implemented on a Windows host. Keeping the feature set minimal means a
+# non-Windows build of this manifest still resolves cleanly for
+# `cargo metadata`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+] }

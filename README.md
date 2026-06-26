@@ -176,8 +176,51 @@ after `execv`, and `fork`-ing a cleanup watchdog from the ad-hoc-signed no_std
 loader triggers AMFI SIGKILL on the exec'd program). These files are harmless
 (owner-only, `chmod 0500`) and are cleared on reboot.
 
-This feature is `#[cfg(target_os = "linux")]` / `#[cfg(target_os = "macos")]`.
-Windows keeps the runner model (decompress to a temp file, exec).
+### Windows — temp-file SFX (`CreateProcessW`)
+
+Windows has no portable in-memory exec (no `memfd_create`/`fexecve` analogue
+that runs an arbitrary PE buffer without a hand-rolled loader). The Windows
+SFX therefore mirrors the macOS disk-drop trade-off, but with a **single**
+stub segment — the same shape as the Linux SFX:
+
+```
+[ stub PE ][ .upxz container ][ u64 stub_size BE ]
+```
+
+The stub (`winstub/` crate) resolves its own path via `GetModuleFileNameW`,
+reads the trailing 8 bytes to recover `stub_size`, slices out the `.upxz`
+container, decompresses it (zstd **or** gzip — the Windows stub is a normal
+`std` binary with no size gate, unlike the macOS `no_std` loader), writes the
+restored PE to `%TEMP%\upxz-<pid>-<tag>-<stem>.exe`, and `CreateProcessW`s it
+with `argv[0]` set to the stored original name and the remaining `argv`
+forwarded verbatim. The temp file is removed after the child exits.
+
+```powershell
+# build an SFX (Windows)
+upxz -c C:\tools\myapp.exe -o .\myapp.sfx.exe
+.\myapp.sfx.exe --flag value    # forwards --flag value to myapp.exe
+echo $LASTEXITCODE              # myapp's exit code
+```
+
+**No ad-hoc code-signing** is required on Windows (unlike macOS AMFI, Windows
+does not kill a local exec for lacking a signature). Windows Defender /
+SmartScreen may prompt on the first run of an unknown `.exe` — that is host-
+level behaviour for any newly-materialised binary and is not something upxz
+can or should bypass.
+
+**In-memory exec (NT section) is documented but not compiled.** Windows does
+expose a way to start a process directly from a memory section
+(`NtCreateSection` + `NtMapViewOfSection` + `NtCreateProcessEx`), which would
+avoid the temp file entirely. It is intentionally **not implemented** here:
+`windows-sys` exposes `NtCreateSection`/`NtMapViewOfSection` but not
+`NtCreateProcessEx`, the resulting process has no initial thread / PEB / stack
+(a hand-rolled loader is required), and it is the technique AV products most
+aggressively flag. See mneme `docs/upxz/windows.md` for the analysis and the
+PoC plan. Revisit when there is a Windows host to iterate on.
+
+This feature is `#[cfg(target_os = "linux")]` / `#[cfg(target_os = "macos")]`
+/ `#[cfg(target_os = "windows")]`. On any other target `upxz -c` refuses with
+a clear message; the cross-platform runner path (`upxz foo.upxz`) still works.
 
 ## Run a single entry from a `.tar.zst` (`--bin`)
 

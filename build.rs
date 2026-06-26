@@ -8,6 +8,13 @@
 //!   macOS SFX is two-segment `[loader][.upxz][trailer]`; the loader binary is
 //!   the packed file's Mach-O header. Embedded by
 //!   `src/sfx.rs::macos_loader_bytes()`.
+//! - **Windows**: compile the `upxz-winstub` crate (temp-file +
+//!   `CreateProcessW` self-extractor) and copy its `.exe` into
+//!   `OUT_DIR/upxz-winstub.bin`. Embedded by `src/sfx.rs::windows_stub_bytes()`.
+//!   The Windows SFX mirrors the Linux layout
+//!   `[stub][.upxz][trailer: u64 stub_size BE]`; the stub writes the restored
+//!   PE to `%TEMP%` and execs it (Windows has no portable in-memory exec —
+//!   see `winstub/src/main.rs` module docs for the NT-section PoC discussion).
 //! - **Other targets**: emit empty placeholders so `include_bytes!` still
 //!   compiles, and `upxz -c` refuses with a clear message at runtime.
 //!
@@ -34,6 +41,7 @@ fn main() {
     match target_os.as_str() {
         "linux" => build_linux_stub(&out_dir),
         "macos" => build_macos_pieces(&out_dir),
+        "windows" => build_windows_stub(&out_dir),
         _ => emit_empty_placeholders(&out_dir),
     }
 
@@ -86,9 +94,10 @@ fn build_linux_stub(out_dir: &Path) {
         std::fs::copy(&artifact, &stub_path).expect("copy stub to OUT_DIR");
     }
 
-    // Empty placeholder for the macOS loader so `include_bytes!` compiles on
-    // every target. `macos_loader_bytes()` returns None when this is empty.
+    // Empty placeholders for the other platforms so `include_bytes!` compiles
+    // on every target. The accessors return None when these are empty.
     std::fs::write(&loader_path, b"").expect("write empty loader placeholder");
+    std::fs::write(out_dir.join("upxz-winstub.bin"), b"").expect("write empty winstub placeholder");
 
     println!("cargo:rerun-if-changed=stub/src/main.rs");
     println!("cargo:rerun-if-changed=stub/Cargo.toml");
@@ -132,20 +141,95 @@ fn build_macos_pieces(out_dir: &Path) {
     }
     std::fs::copy(&artifact, &loader_path).expect("copy loader to OUT_DIR");
 
-    // Empty placeholder for the Linux stub so `include_bytes!` compiles.
+    // Empty placeholders for the other platforms so `include_bytes!` compiles.
     std::fs::write(&stub_path, b"").expect("write empty stub placeholder");
+    std::fs::write(out_dir.join("upxz-winstub.bin"), b"").expect("write empty winstub placeholder");
 
     println!("cargo:rerun-if-changed=loader/src/main.rs");
     println!("cargo:rerun-if-changed=loader/Cargo.toml");
     println!("cargo:rerun-if-changed={}", artifact.display());
 }
 
-/// Non-Linux/non-macOS targets: emit empty placeholders for both pieces so
-/// `include_bytes!` still compiles. `stub_bytes()` and `macos_loader_bytes()`
-/// both return `None`, and `upxz -c` refuses with a clear runtime message.
+/// Windows: build the `upxz-winstub` workspace member (temp-file +
+/// `CreateProcessW` self-extractor) and copy its `.exe` into
+/// `OUT_DIR/upxz-winstub.bin`. Leaves the Linux stub and macOS loader
+/// placeholders empty.
+///
+/// The winstub is a normal workspace member (unlike the macOS loader, which is
+/// standalone for the no_std + `panic=abort` reason). We still shell out to
+/// `cargo build -p upxz-winstub` for its *bytes*, exactly like the Linux stub
+/// branch — Cargo does not otherwise expose a sibling's built artifact to a
+/// build script.
+fn build_windows_stub(out_dir: &Path) {
+    let stub_path = out_dir.join("upxz-winstub.bin");
+    let linux_stub_path = out_dir.join("upxz-stub.bin");
+    let loader_path = out_dir.join("upxz-loader.bin");
+
+    // Build the winstub as a release artifact targeting the host triple.
+    // Release because the stub runs on every SFX invocation: size + speed
+    // matter, and a stripped optimized stub is much smaller than a debug one.
+    let target = env::var("HOST").expect("HOST set by Cargo");
+    let status = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()))
+        .args([
+            "build",
+            "--release",
+            "-p",
+            "upxz-winstub",
+            "--target",
+            &target,
+        ])
+        .status()
+        .expect("failed to invoke `cargo build -p upxz-winstub`");
+    if !status.success() {
+        panic!("building upxz-winstub failed (exit {:?})", status.code());
+    }
+
+    // Locate the produced binary. With an explicit `--target`, the artifact is
+    // under `target/<triple>/release/`. The winstub binary has a `.exe`
+    // suffix on Windows hosts and no suffix elsewhere (the cross-compile case
+    // still names it `upxz-winstub` with no extension in `target/`, because
+    // cargo does not append `.exe` unless the *host* is Windows).
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let artifact = manifest_dir
+        .join("target")
+        .join(&target)
+        .join("release")
+        .join(winstub_binary_name());
+    let artifact = if artifact.is_file() {
+        artifact
+    } else {
+        // Fall back to the no-target path in case the caller overrode target-dir.
+        let alt = manifest_dir
+            .join("target")
+            .join("release")
+            .join(winstub_binary_name());
+        if !alt.is_file() {
+            panic!(
+                "upxz-winstub binary not found at {} (nor {})",
+                artifact.display(),
+                alt.display()
+            );
+        }
+        alt
+    };
+    std::fs::copy(&artifact, &stub_path).expect("copy winstub to OUT_DIR");
+
+    // Empty placeholders for the other platforms so `include_bytes!` compiles.
+    std::fs::write(&linux_stub_path, b"").expect("write empty stub placeholder");
+    std::fs::write(&loader_path, b"").expect("write empty loader placeholder");
+
+    println!("cargo:rerun-if-changed=winstub/src/main.rs");
+    println!("cargo:rerun-if-changed=winstub/Cargo.toml");
+    println!("cargo:rerun-if-changed={}", artifact.display());
+}
+
+/// Non-Linux/non-macOS/non-Windows targets: emit empty placeholders for all
+/// three pieces so `include_bytes!` still compiles. The accessors return
+/// `None`, and `upxz -c` refuses with a clear runtime message.
 fn emit_empty_placeholders(out_dir: &Path) {
     std::fs::write(out_dir.join("upxz-stub.bin"), b"").expect("write empty stub placeholder");
     std::fs::write(out_dir.join("upxz-loader.bin"), b"").expect("write empty loader placeholder");
+    std::fs::write(out_dir.join("upxz-winstub.bin"), b"").expect("write empty winstub placeholder");
 }
 
 fn stub_binary_name() -> &'static str {
@@ -154,4 +238,19 @@ fn stub_binary_name() -> &'static str {
 
 fn loader_binary_name() -> &'static str {
     "upxz-loader"
+}
+
+/// The winstub binary file name as cargo writes it for the TARGET. Cargo
+/// appends `.exe` when the *target* is Windows; this function is only reached
+/// from `build_windows_stub` (i.e. `CARGO_CFG_TARGET_OS == "windows"`), so the
+/// `.exe` form is what lands on disk. We still check the env var rather than
+/// `cfg!` so a non-Windows HOST cross-compiling to Windows picks the right
+/// name (cargo uses the target triple to decide the suffix).
+fn winstub_binary_name() -> String {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "windows" {
+        "upxz-winstub.exe".to_owned()
+    } else {
+        "upxz-winstub".to_owned()
+    }
 }

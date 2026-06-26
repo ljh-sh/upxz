@@ -12,6 +12,25 @@ Refs: mneme#41, upxz PR#5 (Linux memfd), #6 (macOS three-part A, superseded), #7
 
 # Unreleased
 
+- **Windows SFX (`upxz -c` on Windows)**: a third platform for the
+  self-extracting-binary feature. The Windows SFX layout mirrors the Linux
+  stub (`[stub][.upxz][trailer: u64 stub_size BE]`); the `upxz-winstub` crate
+  resolves its own path via `GetModuleFileNameW`, decompresses the `.upxz`
+  payload (zstd **and** gzip — no size gate, unlike the macOS `no_std`
+  loader), writes the restored PE to `%TEMP%`, and `CreateProcessW`s it with
+  argv forwarded verbatim. **No ad-hoc code-signing** is required on Windows
+  (unlike macOS AMFI). The in-memory NT-section route
+  (`NtCreateSection`/`NtCreateProcessEx`) is **documented but not compiled** —
+  `windows-sys` lacks `NtCreateProcessEx`, the resulting process has no
+  initial thread/PEB, and it is the technique AV most aggressively flags; see
+  `winstub/src/main.rs` and mneme `docs/upxz/windows.md`. The temp-file path
+  is the supported Windows mechanism.
+- **Status**: code complete + cross-compile-verified to `x86_64-pc-windows-gnu`;
+  **awaiting real-Windows runtime validation** (develop host is macOS).
+  Linux/macOS SFX branches are untouched (`#[cfg]`-isolated); 32 existing
+  tests still pass.
+- Refs: mneme `docs/upxz/windows.md`; PR `feat/sfx-windows`.
+
 - **Codec-agnostic container (`--gz`)**: the magic byte at offset 5 now carries
   a codec id — `0` = zstd (default, fully backward-compatible), `1` = gzip. The
   runner / unpacker / list / test paths all dispatch on this byte, so one upxz
