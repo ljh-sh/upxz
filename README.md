@@ -70,6 +70,37 @@ only, so the build stays a single binary with a permissive license story
 (Apache-2.0 project + BSD-licensed zstd bindings) and no LGPL entanglement.
 See [`DESIGN.md`](DESIGN.md) for the full rationale.
 
+## Linux self-extracting binaries (`-c` / `--create-sfx`)
+
+On Linux, `upxz -c <orig> <packed>` produces a **self-extracting executable**:
+a single `packed` file you can `chmod +x` and run directly. Running it
+decompresses the original into a `memfd_create` memory file and `fexecve`s
+it — **no temp file is ever written to disk**, and the original runs with its
+own name as `argv[0]` and all trailing args forwarded verbatim.
+
+```bash
+# build an SFX (Linux only)
+upxz -c /usr/local/bin/myapp ./myapp.sfx
+
+# run it — argv and exit code are transparent
+./myapp.sfx --flag value    # forwards --flag value to myapp
+echo $?                     # myapp's exit code
+```
+
+Layout of an SFX file:
+
+```
+[ stub ELF ][ .upxz container (magic+namelen+name+zstd) ][ u64 stub_size BE ]
+```
+
+The stub reads `/proc/self/exe`, recovers `stub_size` from the trailing 8
+bytes, slices out the `.upxz` container, decompresses, and execs. The stub
+(`stub/` crate) is compiled and embedded into `upxz` at build time by
+`build.rs`, so `upxz -c` needs no separate artifact on disk.
+
+This feature is `#[cfg(target_os = "linux")]` only. macOS/Windows keep the
+runner model (decompress to a temp file, exec).
+
 ## Container format
 
 ```

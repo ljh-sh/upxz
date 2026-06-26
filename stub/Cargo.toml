@@ -1,0 +1,15 @@
+[package]
+name = "upxz-stub"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Linux SFX stub for upxz: reads a .upxz trailer from its own ELF and fexecves the restored binary from a memfd."
+publish = false
+
+[[bin]]
+name = "upxz-stub"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+zstd = "0.13"

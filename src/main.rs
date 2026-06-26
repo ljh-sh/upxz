@@ -15,6 +15,7 @@
 
 mod format;
 mod level;
+mod sfx;
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
@@ -35,6 +36,18 @@ struct Cli {
     /// Input file. A plain file → packed to <FILE>.upxz; a .upxz container → run.
     #[arg(value_name = "FILE")]
     file: PathBuf,
+
+    /// Create a Linux self-extracting binary (SFX). `upxz -c <orig> <packed>`
+    /// writes an executable `packed` = [stub + .upxz + trailer]; running it
+    /// decompresses the original to a memfd and fexecves it in-memory, with no
+    /// temp file on disk. The original is the first positional, the output is
+    /// the second. Linux only.
+    #[arg(short = 'c', long = "create-sfx")]
+    create_sfx: bool,
+
+    /// When used with `-c`, the output SFX path. Required iff `-c` is set.
+    #[arg(value_name = "PACKED", requires = "create_sfx")]
+    sfx_output: Option<PathBuf>,
 
     /// Decompress / restore a .upxz container to its original file.
     #[arg(short = 'd', long = "decompress")]
@@ -77,6 +90,12 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.create_sfx {
+        let out = cli
+            .sfx_output
+            .ok_or_else(|| anyhow::anyhow!("-c requires an output path"))?;
+        return pack_sfx(&cli.file, &out, cli.level.resolve(), cli.force, cli.quiet);
+    }
     if cli.list {
         return list(&cli.file);
     }
@@ -250,6 +269,80 @@ fn run(file: &Path, quiet: bool, trailing: &[String]) -> Result<()> {
         .with_context(|| format!("failed to exec restored binary {}", tmp.display()))?;
     let _ = fs::remove_file(&tmp);
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Pack an input file into a Linux **self-extracting executable** (SFX, plan D).
+///
+/// Layout of the produced `packed` file:
+/// ```text
+/// [ stub ELF bytes ][ .upxz container ][ trailer: u64 stub_size, big-endian ]
+/// ```
+/// The stub is the `upxz-stub` binary embedded into this packer at build time.
+/// On run, the stub reads `/proc/self/exe`, recovers `stub_size` from the last
+/// 8 bytes, slices the `.upxz` container out, decompresses the original into a
+/// memfd, and `fexecve`s it with `argv[0]` = stored name and `argv[1..]`
+/// forwarded verbatim. No temp file is written.
+///
+/// Linux-only: the stub depends on `memfd_create` + `fexecve`. On other
+/// platforms `pack_sfx` refuses with an explicit error rather than producing a
+/// non-functional artifact.
+fn pack_sfx(input: &Path, output: &Path, zstd_level: i32, force: bool, quiet: bool) -> Result<()> {
+    // The stub bytes are embedded at build time only on Linux.
+    let stub = sfx::stub_bytes()
+        .ok_or_else(|| anyhow::anyhow!("upxz was not built with the Linux SFX stub; rebuild on Linux"))?;
+    ensure!(
+        !stub.is_empty(),
+        "upxz-stub artifact is empty; the SFX stub did not build correctly"
+    );
+
+    let raw = read_input_file(input)?;
+    check_packable_input(&raw)?; // refuse double-pack
+    let name = sanitize_name(input)?;
+
+    let payload = zstd::encode_all(raw.as_slice(), zstd_level)
+        .with_context(|| format!("zstd compression failed at level {zstd_level}"))?;
+    let header_bytes = Header { name: name.clone() }.encode();
+
+    if output.exists() && !force {
+        bail!("output {} already exists; use -f to overwrite", output.display());
+    }
+
+    // [ stub ][ .upxz container ][ trailer u64 stub_size BE ]
+    let stub_size = u64::try_from(stub.len()).context("stub too large to address")?;
+    let mut out = fs::File::create(output)
+        .with_context(|| format!("cannot create output {}", output.display()))?;
+    out.write_all(stub)
+        .with_context(|| format!("cannot write stub to {}", output.display()))?;
+    out.write_all(&header_bytes)
+        .with_context(|| format!("cannot write header to {}", output.display()))?;
+    out.write_all(&payload)
+        .with_context(|| format!("cannot write payload to {}", output.display()))?;
+    out.write_all(&stub_size.to_be_bytes())
+        .with_context(|| format!("cannot write trailer to {}", output.display()))?;
+    out.flush()?;
+
+    // chmod +x so the SFX is directly executable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(output, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("cannot chmod output {}", output.display()))?;
+    }
+
+    if !quiet {
+        let total = stub.len() + header_bytes.len() + payload.len() + 8;
+        eprintln!(
+            "sfx {} -> {} ({} -> {} bytes; stub {}, payload {}, zstd {})",
+            input.display(),
+            output.display(),
+            raw.len(),
+            total,
+            stub.len(),
+            payload.len(),
+            zstd_level
+        );
+    }
+    Ok(())
 }
 
 fn list(file: &Path) -> Result<()> {
