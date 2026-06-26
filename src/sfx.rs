@@ -31,6 +31,10 @@ pub fn stub_bytes() -> Option<&'static [u8]> {
 /// Return the embedded macOS upxz-loader binary bytes, or `None` when upxz is
 /// not built on macOS. In the two-segment design this loader is the packed
 /// file's Mach-O header.
+///
+/// Only called from the macOS SFX packer (`pack_sfx_macos`); on other targets
+/// the function is dead code, hence the allow.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn macos_loader_bytes() -> Option<&'static [u8]> {
     let bytes: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/upxz-loader.bin"));
     if bytes.is_empty() {
