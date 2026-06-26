@@ -827,7 +827,10 @@ fn pack_gz_runs_packed_script() {
         let packed = sb.expected("hello.sh.upxz");
         assert_has_gzip_magic(&packed);
 
-        let out = std::process::Command::new("target/release/upxz")
+        // Resolve the freshly-built upxz binary the way assert_cmd does, so the
+        // test works under both `cargo test` (debug) and `cargo test --release`.
+        let upxz_bin = assert_cmd::cargo::cargo_bin("upxz");
+        let out = std::process::Command::new(upxz_bin)
             .arg(&packed)
             .output()
             .unwrap_or_else(|e| panic!("run upxz: {e}"));
