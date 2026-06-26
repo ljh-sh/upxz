@@ -70,16 +70,22 @@ only, so the build stays a single binary with a permissive license story
 (Apache-2.0 project + BSD-licensed zstd bindings) and no LGPL entanglement.
 See [`DESIGN.md`](DESIGN.md) for the full rationale.
 
-## Linux self-extracting binaries (`-c` / `--create-sfx`)
+## Self-extracting binaries (`-c` / `--create-sfx`)
 
-On Linux, `upxz -c <orig> <packed>` produces a **self-extracting executable**:
-a single `packed` file you can `chmod +x` and run directly. Running it
-decompresses the original into a `memfd_create` memory file and `fexecve`s
-it — **no temp file is ever written to disk**, and the original runs with its
-own name as `argv[0]` and all trailing args forwarded verbatim.
+`upxz -c <orig> <packed>` produces a **self-extracting executable**: a single
+`packed` file you can `chmod +x` and run directly. Running it decompresses the
+original and execs it with the original name as `argv[0]` and all trailing
+args forwarded verbatim; the inner program's exit code is propagated.
+
+The SFX mechanism is platform-specific:
+
+### Linux — in-memory exec (memfd)
+
+Running the packed binary decompresses the original into a `memfd_create`
+memory file and `fexecve`s it — **no temp file is ever written to disk**.
 
 ```bash
-# build an SFX (Linux only)
+# build an SFX (Linux)
 upxz -c /usr/local/bin/myapp ./myapp.sfx
 
 # run it — argv and exit code are transparent
@@ -87,19 +93,55 @@ upxz -c /usr/local/bin/myapp ./myapp.sfx
 echo $?                     # myapp's exit code
 ```
 
-Layout of an SFX file:
+Layout:
 
 ```
 [ stub ELF ][ .upxz container (magic+namelen+name+zstd) ][ u64 stub_size BE ]
 ```
 
-The stub reads `/proc/self/exe`, recovers `stub_size` from the trailing 8
-bytes, slices out the `.upxz` container, decompresses, and execs. The stub
-(`stub/` crate) is compiled and embedded into `upxz` at build time by
-`build.rs`, so `upxz -c` needs no separate artifact on disk.
+The stub (`stub/` crate) reads `/proc/self/exe`, recovers `stub_size` from the
+trailing 8 bytes, slices out the `.upxz` container, decompresses, and execs.
+It is compiled and embedded into `upxz` at build time by `build.rs`, so
+`upxz -c` needs no separate artifact on disk.
 
-This feature is `#[cfg(target_os = "linux")]` only. macOS/Windows keep the
-runner model (decompress to a temp file, exec).
+### macOS — three-segment SFX (boot + loader)
+
+macOS has no `memfd_create` / in-memory exec, so the SFX is three segments:
+
+```
+[ boot sh script ][ upxz-loader ][ .upxz container ][ trailer ]
+```
+
+The trailer (last 20 bytes) records each segment's length so boot and loader
+can locate their own slice:
+
+```
+b"UPXZEND1" (8) + boot_len (u32 BE) + loader_len (u32 BE) + app_len (u32 BE)
+```
+
+Running `./packed` executes the boot script via its shebang — the kernel runs
+`/bin/sh` on the file, so **the packed file itself is not codesigned** (it is
+treated as a shell script, not a Mach-O). Boot extracts the embedded
+`upxz-loader` to `~/.cache/upxz/upxz-loader-<len>` (reused across invocations),
+ad-hoc signs it, and execs it. The loader (a `#![no_std]` binary, ~84 KB)
+reads the same trailer, slices out the `.upxz` app segment, zstd-decompresses
+it, writes the restored binary to `/tmp/upxz-app-<pid>`, ad-hoc re-signs it
+(macOS AMFI SIGKILLs an unsigned restored copy on exec), and `execv`s it.
+
+```bash
+# build an SFX (macOS)
+upxz -c /usr/local/bin/myapp ./myapp.sfx
+./myapp.sfx --flag value    # forwards --flag value to myapp
+echo $?                     # myapp's exit code
+```
+
+Each run leaves a `/tmp/upxz-app-<pid>` behind (the loader cannot `unlink`
+after `execv`, and `fork`-ing a cleanup watchdog from the ad-hoc-signed no_std
+loader triggers AMFI SIGKILL on the exec'd program). These files are harmless
+(owner-only, `chmod 0500`) and are cleared on reboot.
+
+This feature is `#[cfg(target_os = "linux")]` / `#[cfg(target_os = "macos")]`.
+Windows keeps the runner model (decompress to a temp file, exec).
 
 ## Container format
 

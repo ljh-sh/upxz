@@ -37,11 +37,21 @@ struct Cli {
     #[arg(value_name = "FILE")]
     file: PathBuf,
 
-    /// Create a Linux self-extracting binary (SFX). `upxz -c <orig> <packed>`
-    /// writes an executable `packed` = [stub + .upxz + trailer]; running it
-    /// decompresses the original to a memfd and fexecves it in-memory, with no
-    /// temp file on disk. The original is the first positional, the output is
-    /// the second. Linux only.
+    /// Create a self-extracting binary (SFX). `upxz -c <orig> <packed>` writes
+    /// an executable `packed` file that, when run, decompresses and execs the
+    /// original. The original is the first positional, the output is the
+    /// second.
+    ///
+    /// The SFX mechanism is platform-specific:
+    /// - **Linux**: `packed = [stub][.upxz][trailer]`. The stub uses
+    ///   `memfd_create` + `fexecve` so the original lives only in memory — no
+    ///   temp file on disk.
+    /// - **macOS**: `packed = [boot sh][upxz-loader][.upxz][trailer]` (three
+    ///   segments). The boot script (`#!/bin/sh`) extracts the embedded
+    ///   `upxz-loader` to a cache dir and execs it; the loader decompresses
+    ///   the original to a temp file and execs that (macOS has no in-memory
+    ///   exec). The packed file itself is a shell script and does not need to
+    ///   be codesigned.
     #[arg(short = 'c', long = "create-sfx")]
     create_sfx: bool,
 
@@ -152,7 +162,10 @@ fn pack(input: &Path, zstd_level: i32, force: bool, quiet: bool) -> Result<()> {
 
     let out_path = default_pack_output(input);
     if out_path.exists() && !force {
-        bail!("output {} already exists; use -f to overwrite", out_path.display());
+        bail!(
+            "output {} already exists; use -f to overwrite",
+            out_path.display()
+        );
     }
     let header_bytes = Header { name }.encode();
     let mut out = fs::File::create(&out_path)
@@ -184,9 +197,16 @@ fn unpack(input: &Path, force: bool, quiet: bool) -> Result<()> {
 
     let out_path = unpack_output(input, &header.name)?;
     if out_path.exists() && !force {
-        bail!("output {} already exists; use -f to overwrite", out_path.display());
+        bail!(
+            "output {} already exists; use -f to overwrite",
+            out_path.display()
+        );
     }
-    ensure!(!out_path.is_dir(), "output {} is a directory", out_path.display());
+    ensure!(
+        !out_path.is_dir(),
+        "output {} is a directory",
+        out_path.display()
+    );
 
     fs::write(&out_path, &restored)
         .with_context(|| format!("cannot write to {}", out_path.display()))?;
@@ -249,9 +269,8 @@ fn run(file: &Path, quiet: bool, trailing: &[String]) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o500)).with_context(|| {
-            format!("cannot chmod restored binary {}", tmp.display())
-        })?;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o500))
+            .with_context(|| format!("cannot chmod restored binary {}", tmp.display()))?;
     }
 
     if !quiet {
@@ -271,30 +290,21 @@ fn run(file: &Path, quiet: bool, trailing: &[String]) -> Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-/// Pack an input file into a Linux **self-extracting executable** (SFX, plan D).
+/// Pack an input file into a **self-extracting executable** (SFX).
 ///
-/// Layout of the produced `packed` file:
-/// ```text
-/// [ stub ELF bytes ][ .upxz container ][ trailer: u64 stub_size, big-endian ]
-/// ```
-/// The stub is the `upxz-stub` binary embedded into this packer at build time.
-/// On run, the stub reads `/proc/self/exe`, recovers `stub_size` from the last
-/// 8 bytes, slices the `.upxz` container out, decompresses the original into a
-/// memfd, and `fexecve`s it with `argv[0]` = stored name and `argv[1..]`
-/// forwarded verbatim. No temp file is written.
+/// The SFX layout depends on the target OS:
+/// - **Linux** (`pack_sfx_linux`): `[ stub ][ .upxz container ][ trailer: u64 stub_size BE ]`.
+///   The stub reads `/proc/self/exe`, slices the `.upxz` out, decompresses it
+///   into a memfd, and `fexecve`s it — no temp file.
+/// - **macOS** (`pack_sfx_macos`): `[ boot sh ][ upxz-loader ][ .upxz ][ trailer ]`.
+///   `./packed` runs the boot script, which extracts the loader to a cache dir
+///   and execs it; the loader decompresses the original to a temp file and
+///   execs that. macOS has no in-memory exec. The packed file is a shell
+///   script and is not codesigned.
 ///
-/// Linux-only: the stub depends on `memfd_create` + `fexecve`. On other
-/// platforms `pack_sfx` refuses with an explicit error rather than producing a
-/// non-functional artifact.
+/// On other targets `pack_sfx` refuses with an explicit error rather than
+/// producing a non-functional artifact.
 fn pack_sfx(input: &Path, output: &Path, zstd_level: i32, force: bool, quiet: bool) -> Result<()> {
-    // The stub bytes are embedded at build time only on Linux.
-    let stub = sfx::stub_bytes()
-        .ok_or_else(|| anyhow::anyhow!("upxz was not built with the Linux SFX stub; rebuild on Linux"))?;
-    ensure!(
-        !stub.is_empty(),
-        "upxz-stub artifact is empty; the SFX stub did not build correctly"
-    );
-
     let raw = read_input_file(input)?;
     check_packable_input(&raw)?; // refuse double-pack
     let name = sanitize_name(input)?;
@@ -304,25 +314,83 @@ fn pack_sfx(input: &Path, output: &Path, zstd_level: i32, force: bool, quiet: bo
     let header_bytes = Header { name: name.clone() }.encode();
 
     if output.exists() && !force {
-        bail!("output {} already exists; use -f to overwrite", output.display());
+        bail!(
+            "output {} already exists; use -f to overwrite",
+            output.display()
+        );
     }
 
-    // [ stub ][ .upxz container ][ trailer u64 stub_size BE ]
+    #[cfg(target_os = "linux")]
+    {
+        pack_sfx_linux(
+            input,
+            output,
+            zstd_level,
+            quiet,
+            &raw,
+            &header_bytes,
+            &payload,
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        pack_sfx_macos(
+            input,
+            output,
+            zstd_level,
+            quiet,
+            &raw,
+            &header_bytes,
+            &payload,
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (
+            input,
+            output,
+            zstd_level,
+            quiet,
+            &raw,
+            &header_bytes,
+            &payload,
+        );
+        bail!("upxz -c (SFX) is only supported on Linux and macOS; rebuild upxz on the target platform");
+    }
+}
+
+/// Linux SFX: `[ stub ][ .upxz container ][ trailer: u64 stub_size BE ]`.
+#[cfg(target_os = "linux")]
+fn pack_sfx_linux(
+    input: &Path,
+    output: &Path,
+    zstd_level: i32,
+    quiet: bool,
+    raw: &[u8],
+    header_bytes: &[u8],
+    payload: &[u8],
+) -> Result<()> {
+    let stub = sfx::stub_bytes().ok_or_else(|| {
+        anyhow::anyhow!("upxz was not built with the Linux SFX stub; rebuild on Linux")
+    })?;
+    ensure!(
+        !stub.is_empty(),
+        "upxz-stub artifact is empty; the SFX stub did not build correctly"
+    );
+
     let stub_size = u64::try_from(stub.len()).context("stub too large to address")?;
     let mut out = fs::File::create(output)
         .with_context(|| format!("cannot create output {}", output.display()))?;
     out.write_all(stub)
         .with_context(|| format!("cannot write stub to {}", output.display()))?;
-    out.write_all(&header_bytes)
+    out.write_all(header_bytes)
         .with_context(|| format!("cannot write header to {}", output.display()))?;
-    out.write_all(&payload)
+    out.write_all(payload)
         .with_context(|| format!("cannot write payload to {}", output.display()))?;
     out.write_all(&stub_size.to_be_bytes())
         .with_context(|| format!("cannot write trailer to {}", output.display()))?;
     out.flush()?;
 
-    // chmod +x so the SFX is directly executable.
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(output, fs::Permissions::from_mode(0o755))
@@ -345,11 +413,105 @@ fn pack_sfx(input: &Path, output: &Path, zstd_level: i32, force: bool, quiet: bo
     Ok(())
 }
 
+/// macOS SFX: `[ boot sh ][ upxz-loader ][ .upxz container ][ trailer ]`.
+///
+/// The trailer is 20 bytes at the very end:
+/// ```text
+///   b"UPXZEND1"   (8 bytes magic)
+///   boot_len      (u32 big-endian)
+///   loader_len    (u32 big-endian)
+///   app_len       (u32 big-endian)   <- length of the .upxz container
+/// ```
+/// `./packed` runs the boot script (the file\'s shebang makes the kernel exec
+/// `/bin/sh` on it); the trailing binary bytes after the script are ignored by
+/// sh. Boot extracts the loader segment to `~/.cache/upxz/upxz-loader-<len>`,
+/// ad-hoc codesigns it, and execs it with `argv[1]=packed`. The loader reads
+/// the same trailer, locates the app segment, zstd-decompresses it, writes the
+/// restored binary to `/tmp/upxz-app-<pid>`, ad-hoc codesigns that, and
+/// `execv`s it. See mneme `docs/upxz/` for the full design.
+#[cfg(target_os = "macos")]
+fn pack_sfx_macos(
+    input: &Path,
+    output: &Path,
+    zstd_level: i32,
+    quiet: bool,
+    raw: &[u8],
+    header_bytes: &[u8],
+    payload: &[u8],
+) -> Result<()> {
+    let boot = sfx::macos_boot_bytes().ok_or_else(|| {
+        anyhow::anyhow!("upxz was not built with the macOS SFX boot script; rebuild on macOS")
+    })?;
+    let loader = sfx::macos_loader_bytes().ok_or_else(|| {
+        anyhow::anyhow!("upxz was not built with the macOS SFX loader; rebuild on macOS")
+    })?;
+    ensure!(
+        !boot.is_empty(),
+        "upxz boot script artifact is empty; the SFX boot did not build correctly"
+    );
+    ensure!(
+        !loader.is_empty(),
+        "upxz-loader artifact is empty; the SFX loader did not build correctly"
+    );
+
+    // Build the trailer: magic + boot_len + loader_len + app_len (all u32 BE).
+    // app_len is the full .upxz container length (header + payload).
+    let app_len = u32::try_from(header_bytes.len() + payload.len())
+        .context(".upxz container too large to address")?;
+    let boot_len = u32::try_from(boot.len()).context("boot script too large to address")?;
+    let loader_len = u32::try_from(loader.len()).context("loader too large to address")?;
+    let trailer: Vec<u8> = {
+        let mut t = Vec::with_capacity(20);
+        t.extend_from_slice(b"UPXZEND1");
+        t.extend_from_slice(&boot_len.to_be_bytes());
+        t.extend_from_slice(&loader_len.to_be_bytes());
+        t.extend_from_slice(&app_len.to_be_bytes());
+        t
+    };
+
+    let mut out = fs::File::create(output)
+        .with_context(|| format!("cannot create output {}", output.display()))?;
+    out.write_all(boot)
+        .with_context(|| format!("cannot write boot script to {}", output.display()))?;
+    out.write_all(loader)
+        .with_context(|| format!("cannot write loader to {}", output.display()))?;
+    out.write_all(header_bytes)
+        .with_context(|| format!("cannot write header to {}", output.display()))?;
+    out.write_all(payload)
+        .with_context(|| format!("cannot write payload to {}", output.display()))?;
+    out.write_all(&trailer)
+        .with_context(|| format!("cannot write trailer to {}", output.display()))?;
+    out.flush()?;
+
+    // chmod +x so `./packed` runs the boot shebang.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(output, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("cannot chmod output {}", output.display()))?;
+    }
+
+    if !quiet {
+        let total = boot.len() + loader.len() + header_bytes.len() + payload.len() + trailer.len();
+        eprintln!(
+            "sfx {} -> {} ({} -> {} bytes; boot {}, loader {}, payload {}, zstd {})",
+            input.display(),
+            output.display(),
+            raw.len(),
+            total,
+            boot.len(),
+            loader.len(),
+            payload.len(),
+            zstd_level
+        );
+    }
+    Ok(())
+}
+
 fn list(file: &Path) -> Result<()> {
     let buf = read_input_file(file)?;
     let (header, payload_offset) = parse_header(&buf)?;
-    let original = zstd::decode_all(&buf[payload_offset..])
-        .context("decompression failed while listing")?;
+    let original =
+        zstd::decode_all(&buf[payload_offset..]).context("decompression failed while listing")?;
     let ratio = if original.is_empty() {
         0.0
     } else {
