@@ -3,7 +3,7 @@
 //! A `.upxz` file is a container: `magic + original-name + zstd(original bytes)`.
 //! - `upxz foo`        → if foo is a plain file: **pack** to `foo.upxz`
 //! - `upxz foo.upxz`   → magic detected: **run** (decompress original to a temp
-//!                       file and exec it, propagating exit code)
+//!   file and exec it, propagating exit code)
 //! - `upxz -d foo.upxz`→ **unpack** (restore original bytes)
 //! - `upxz -l/-t`      → list / test (read-only)
 //!
@@ -46,12 +46,12 @@ struct Cli {
     /// - **Linux**: `packed = [stub][.upxz][trailer]`. The stub uses
     ///   `memfd_create` + `fexecve` so the original lives only in memory — no
     ///   temp file on disk.
-    /// - **macOS**: `packed = [boot sh][upxz-loader][.upxz][trailer]` (three
-    ///   segments). The boot script (`#!/bin/sh`) extracts the embedded
-    ///   `upxz-loader` to a cache dir and execs it; the loader decompresses
-    ///   the original to a temp file and execs that (macOS has no in-memory
-    ///   exec). The packed file itself is a shell script and does not need to
-    ///   be codesigned.
+    /// - **macOS**: `packed = [upxz-loader][.upxz][trailer]` (two segments).
+    ///   The loader binary IS the packed file's Mach-O header (codesigned);
+    ///   `./packed` execs the loader directly, which decompresses the original
+    ///   to a temp file and execs it (macOS has no in-memory exec). The
+    ///   appended app bytes break `codesign --verify --strict`, but exec is
+    ///   unaffected (AMFI accepts the loader's cdhash).
     #[arg(short = 'c', long = "create-sfx")]
     create_sfx: bool,
 
@@ -296,11 +296,13 @@ fn run(file: &Path, quiet: bool, trailing: &[String]) -> Result<()> {
 /// - **Linux** (`pack_sfx_linux`): `[ stub ][ .upxz container ][ trailer: u64 stub_size BE ]`.
 ///   The stub reads `/proc/self/exe`, slices the `.upxz` out, decompresses it
 ///   into a memfd, and `fexecve`s it — no temp file.
-/// - **macOS** (`pack_sfx_macos`): `[ boot sh ][ upxz-loader ][ .upxz ][ trailer ]`.
-///   `./packed` runs the boot script, which extracts the loader to a cache dir
-///   and execs it; the loader decompresses the original to a temp file and
-///   execs that. macOS has no in-memory exec. The packed file is a shell
-///   script and is not codesigned.
+/// - **macOS** (`pack_sfx_macos`): `[ upxz-loader ][ .upxz container ][ trailer ]`.
+///   Two-segment design: the packed file's Mach-O header IS the loader
+///   (codesigned). `./packed` execs the loader directly; the loader reads its
+///   own trailer, slices the app segment out, decompresses it to a temp file,
+///   re-signs it, and `execv`s it. macOS has no in-memory exec. The appended
+///   app bytes make `codesign --verify --strict` fail, but exec is unaffected
+///   (AMFI accepts the loader's cdhash).
 ///
 /// On other targets `pack_sfx` refuses with an explicit error rather than
 /// producing a non-functional artifact.
@@ -413,22 +415,23 @@ fn pack_sfx_linux(
     Ok(())
 }
 
-/// macOS SFX: `[ boot sh ][ upxz-loader ][ .upxz container ][ trailer ]`.
+/// macOS SFX (two-segment): `[ upxz-loader ][ .upxz container ][ trailer ]`.
 ///
-/// The trailer is 20 bytes at the very end:
+/// The trailer is 16 bytes at the very end:
 /// ```text
 ///   b"UPXZEND1"   (8 bytes magic)
-///   boot_len      (u32 big-endian)
-///   loader_len    (u32 big-endian)
-///   app_len       (u32 big-endian)   <- length of the .upxz container
+///   loader_len    (u32 big-endian)   <- length of the loader Mach-O segment
+///   app_len       (u32 big-endian)   <- length of the .upxz container segment
 /// ```
-/// `./packed` runs the boot script (the file\'s shebang makes the kernel exec
-/// `/bin/sh` on it); the trailing binary bytes after the script are ignored by
-/// sh. Boot extracts the loader segment to `~/.cache/upxz/upxz-loader-<len>`,
-/// ad-hoc codesigns it, and execs it with `argv[1]=packed`. The loader reads
-/// the same trailer, locates the app segment, zstd-decompresses it, writes the
-/// restored binary to `/tmp/upxz-app-<pid>`, ad-hoc codesigns that, and
-/// `execv`s it. See mneme `docs/upxz/` for the full design.
+/// The packed file's Mach-O header IS the loader (codesigned). `./packed`
+/// execs the loader directly: the kernel reads the `mach_header` at offset 0,
+/// AMFI accepts the loader's cdhash, and the appended app bytes are ignored at
+/// exec time (they DO make `codesign --verify --strict` fail, but exec works —
+/// verified empirically). The loader reads its own path via
+/// `_NSGetExecutablePath`, slices the app segment out at offset `loader_len`,
+/// zstd-decompresses it, writes the restored binary to `/tmp/upxz-app-<pid>`,
+/// ad-hoc codesigns that, and `execv`s it. See mneme `docs/upxz/` for the full
+/// design and the codesign-decision trade-off.
 #[cfg(target_os = "macos")]
 fn pack_sfx_macos(
     input: &Path,
@@ -439,31 +442,22 @@ fn pack_sfx_macos(
     header_bytes: &[u8],
     payload: &[u8],
 ) -> Result<()> {
-    let boot = sfx::macos_boot_bytes().ok_or_else(|| {
-        anyhow::anyhow!("upxz was not built with the macOS SFX boot script; rebuild on macOS")
-    })?;
     let loader = sfx::macos_loader_bytes().ok_or_else(|| {
         anyhow::anyhow!("upxz was not built with the macOS SFX loader; rebuild on macOS")
     })?;
-    ensure!(
-        !boot.is_empty(),
-        "upxz boot script artifact is empty; the SFX boot did not build correctly"
-    );
     ensure!(
         !loader.is_empty(),
         "upxz-loader artifact is empty; the SFX loader did not build correctly"
     );
 
-    // Build the trailer: magic + boot_len + loader_len + app_len (all u32 BE).
+    // Build the trailer: magic + loader_len + app_len (all u32 BE).
     // app_len is the full .upxz container length (header + payload).
     let app_len = u32::try_from(header_bytes.len() + payload.len())
         .context(".upxz container too large to address")?;
-    let boot_len = u32::try_from(boot.len()).context("boot script too large to address")?;
     let loader_len = u32::try_from(loader.len()).context("loader too large to address")?;
     let trailer: Vec<u8> = {
-        let mut t = Vec::with_capacity(20);
+        let mut t = Vec::with_capacity(16);
         t.extend_from_slice(b"UPXZEND1");
-        t.extend_from_slice(&boot_len.to_be_bytes());
         t.extend_from_slice(&loader_len.to_be_bytes());
         t.extend_from_slice(&app_len.to_be_bytes());
         t
@@ -471,8 +465,6 @@ fn pack_sfx_macos(
 
     let mut out = fs::File::create(output)
         .with_context(|| format!("cannot create output {}", output.display()))?;
-    out.write_all(boot)
-        .with_context(|| format!("cannot write boot script to {}", output.display()))?;
     out.write_all(loader)
         .with_context(|| format!("cannot write loader to {}", output.display()))?;
     out.write_all(header_bytes)
@@ -483,7 +475,9 @@ fn pack_sfx_macos(
         .with_context(|| format!("cannot write trailer to {}", output.display()))?;
     out.flush()?;
 
-    // chmod +x so `./packed` runs the boot shebang.
+    // chmod +x so `./packed` execs the loader Mach-O. The loader is already
+    // codesigned (build.rs signs it standalone), and exec does not require the
+    // appended app bytes to be part of the signature.
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(output, fs::Permissions::from_mode(0o755))
@@ -491,14 +485,13 @@ fn pack_sfx_macos(
     }
 
     if !quiet {
-        let total = boot.len() + loader.len() + header_bytes.len() + payload.len() + trailer.len();
+        let total = loader.len() + header_bytes.len() + payload.len() + trailer.len();
         eprintln!(
-            "sfx {} -> {} ({} -> {} bytes; boot {}, loader {}, payload {}, zstd {})",
+            "sfx {} -> {} ({} -> {} bytes; loader {}, payload {}, zstd {})",
             input.display(),
             output.display(),
             raw.len(),
             total,
-            boot.len(),
             loader.len(),
             payload.len(),
             zstd_level

@@ -3,7 +3,7 @@ name = "upxz-loader"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.74"
-description = "macOS SFX loader for upxz: no_std zstd decoder that reads a three-segment packed file, decompresses the embedded app, and execs it."
+description = "macOS SFX loader for upxz: no_std zstd decoder that IS the two-segment packed file's Mach-O header, decompresses the embedded app segment, and execs it."
 publish = false
 
 # This binary is `#![no_std]` + `#![no_main]`. We link zstd-sys directly (FFI)
