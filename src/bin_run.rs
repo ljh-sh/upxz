@@ -209,19 +209,14 @@ fn exec_memfd_linux(name: &str, bytes: &[u8], trailing: &[String]) -> Result<()>
     };
 
     // fexecve is the Linux in-memory exec. On success it does not return.
-    let rc = unsafe { libc::fexecve(fd, argv_p.as_mut_ptr(), envp.as_mut_ptr() as *mut *mut _) };
+    // Signature: fexecve(fd, argv: *const *const c_char, envp: *const *const c_char).
+    let rc = unsafe { libc::fexecve(fd, argv_p.as_ptr(), envp.as_ptr()) };
     let err = std::io::Error::last_os_error();
     let _ = rc;
     // If we reach here, fexecve failed.
     // Workaround for musl/glibc without fexecve: fall back to /proc/self/fd.
     let proc_path = CString::new(format!("/proc/self/fd/{}", fd)).unwrap();
-    let rc2 = unsafe {
-        libc::execve(
-            proc_path.as_ptr(),
-            argv_p.as_mut_ptr(),
-            envp.as_mut_ptr() as *mut _,
-        )
-    };
+    let rc2 = unsafe { libc::execve(proc_path.as_ptr(), argv_p.as_ptr(), envp.as_ptr()) };
     let err2 = std::io::Error::last_os_error();
     let _ = rc2;
     bail!("fexecve failed ({err}); /proc/self/fd fallback also failed ({err2})");
