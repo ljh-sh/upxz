@@ -407,6 +407,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "upxz-stub"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "zstd",
+]
+
+[[package]]
 name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

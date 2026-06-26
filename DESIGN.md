@@ -72,3 +72,41 @@ explain "why did the ratio jump oddly at level 20".
   processing. Inputs that are not regular files are rejected.
 - upxz does **not** try to be a general-purpose compressor. The container is a
   thin wrapper; if you only want raw zstd, use `zstd` directly.
+
+## Decision 3 — Linux SFX stub: memfd_create + fexecve (Plan D)
+
+**Choice:** on Linux, `upxz -c <orig> <packed>` emits a self-extracting
+executable = `[ stub ELF ][ .upxz container ][ trailer u64 stub_size BE ]`.
+Running `packed` makes the stub read `/proc/self/exe`, slice out the `.upxz`
+container, decompress the original into a memfd, and `fexecve` it. No temp
+file is written to disk.
+
+**Why Plan D (self-contained stub, in-memory exec) over the alternatives:**
+
+- *Plan A — keep the runner, decompress to a temp file.* This is what upxz
+  already does. It works everywhere, but writes the original (which may be
+  large, sensitive, or subject to integrity checks) to `/tmp` where it can be
+  inspected, raced, or left behind on a crash. For a "ship one binary" story
+  it is a leak.
+- *Plan B — rewrite the ELF in place (UPX-style).* Requires a custom ELF
+  builder, fixup of program headers, and re-signing. Massively more complex,
+  fragile across kernel/glibc versions, and breaks signature verification.
+  Not worth it for a zstd packer.
+- *Plan C — `/proc/self/fd/N` exec after writing a real file.* Half-measure:
+  still writes to disk, gains nothing over Plan A.
+
+Plan D's stub is tiny, dependency-light (`libc` + `zstd`), and uses only
+kernel primitives (`memfd_create`, `fexecve`) available since Linux 3.17 /
+glibc 2.27. The trailer-records-stub-size scheme means the stub never needs
+to know its own length at compile time — it discovers it from the file.
+
+**Why Linux only:** `memfd_create` + `fexecve` are Linux-specific. macOS has
+no memfd equivalent (its closest, `shm_open`, is not sealable and is backed
+by `/tmp`); Windows has an entirely different exec model. The runner path
+(Plan A) remains the cross-platform default. SFX is gated behind
+`#[cfg(target_os = "linux")]` and `upxz -c` refuses with a clear message on
+other platforms.
+
+**How the stub gets into the packer:** `build.rs` compiles the `stub/` crate
+as a release artifact and `include_bytes!`s it into `upxz` at build time, so
+`upxz -c` is self-contained — no separate stub file to ship.

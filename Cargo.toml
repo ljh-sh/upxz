@@ -13,6 +13,7 @@ repository = "https://github.com/ljh-sh/upxz"
 keywords = ["zstd", "pack", "compress", "cli", "single-binary"]
 categories = ["compression", "command-line-utilities"]
 exclude = [".release-artifacts/", ".github/", "target/", "*.swp", "*.swo", "*~", ".DS_Store"]
+build = "build.rs"
 
 [[bin]]
 name = "upxz"
@@ -31,3 +32,13 @@ predicates = "3"
 opt-level = 3
 lto = "thin"
 strip = true
+
+# The SFX stub runs on every invocation of a packed binary; keep it small.
+# opt-level="z" + single codegen unit minimize its size. (Cargo forbids
+# `panic = "abort"` in per-package profiles; we accept the unwind tables.)
+[profile.release.package.upxz-stub]
+opt-level = "z"
+codegen-units = 1
+
+[workspace]
+members = [".", "stub"]

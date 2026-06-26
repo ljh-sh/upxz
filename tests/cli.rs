@@ -285,6 +285,79 @@ fn version_flag_works() {
 }
 
 // ---------------------------------------------------------------------------
+// -c create SFX (Linux only): pack a shell script into a self-extractor and
+// run it. We use a shell script rather than a native binary so the test is
+// portable across architectures inside the Linux container the SFX feature
+// targets. The stub relies on memfd_create + fexecve; a `#!/bin/sh` script
+// is a perfectly valid "binary" for the kernel to exec from a memfd.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn create_sfx_runs_packed_script_linux() {
+    #[cfg(target_os = "linux")]
+    {
+        let sb = Sandbox::new("sfx-script");
+        let script = b"#!/bin/sh\necho sfx-ran; exit 0\n";
+        let input = sb.write("hello.sh", script);
+        let packed = sb.expected("hello.packed");
+
+        bin().arg("-c").arg(&input).arg(&packed).assert().success();
+
+        // The SFX must be executable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&packed).unwrap().permissions().mode();
+            assert!(
+                mode & 0o111 != 0,
+                "SFX output is not executable (mode={:o})",
+                mode
+            );
+        }
+
+        // Running it must exec the restored script and print its output.
+        let out = std::process::Command::new(&packed).output().expect("run SFX");
+        assert!(
+            out.status.success(),
+            "SFX exited {:?}: stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "sfx-ran");
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SFX is Linux-only; nothing to test on other targets.
+    }
+}
+
+#[test]
+fn create_sfx_propagates_exit_code_linux() {
+    #[cfg(target_os = "linux")]
+    {
+        let sb = Sandbox::new("sfx-rc");
+        let script = b"#!/bin/sh\nexit 7\n";
+        let input = sb.write("rc7.sh", script);
+        let packed = sb.expected("rc7.packed");
+
+        bin().arg("-c").arg(&input).arg(&packed).assert().success();
+        std::process::Command::new(&packed)
+            .status()
+            .expect("run SFX")
+            .code()
+            .expect("exit code");
+        let code = std::process::Command::new(&packed)
+            .status()
+            .expect("run SFX 2")
+            .code()
+            .unwrap_or(-1);
+        assert_eq!(code, 7, "SFX must propagate the inner program's exit code");
+    }
+    #[cfg(not(target_os = "linux"))]
+    {}
+}
+
+// ---------------------------------------------------------------------------
 // run (auto-detect on a `.upxz` container) — kept portable by packing a tiny
 // shell script that exits 0. On macOS the restored temp file execs with its
 // own shebang; this avoids any native-binary SIGKILL risk.
