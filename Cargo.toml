@@ -42,3 +42,13 @@ codegen-units = 1
 
 [workspace]
 members = [".", "stub"]
+
+# Note: the macOS `upxz-loader` crate (`loader/`) is **deliberately not** a
+# workspace member. It is `#![no_std]` + `#![no_main]` and requires its own
+# `[profile.release]` with `panic = "abort"` (the precompiled `core` on stable
+# is built with unwind; `panic=abort` at the crate root is what makes the
+# no_std panic-handler path link cleanly without `-Zbuild-std`). Workspace
+# member profiles are ignored in favor of the root profile, so we keep the
+# loader outside the workspace and build it standalone from `build.rs`, exactly
+# like a vendored third-party crate. See `build.rs` (macOS branch) and
+# `loader/Cargo.toml`.

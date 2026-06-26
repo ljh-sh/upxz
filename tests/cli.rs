@@ -206,7 +206,8 @@ fn test_reports_ok() {
     bin().arg(&input).assert().success();
     let packed = sb.expected("data.bin.upxz");
 
-    bin().arg("-t")
+    bin()
+        .arg("-t")
         .arg(&packed)
         .assert()
         .success()
@@ -278,7 +279,8 @@ fn z_overrides_fast() {
 
 #[test]
 fn version_flag_works() {
-    bin().arg("--version")
+    bin()
+        .arg("--version")
         .assert()
         .success()
         .stdout(predicate::str::contains("upxz"));
@@ -316,7 +318,9 @@ fn create_sfx_runs_packed_script_linux() {
         }
 
         // Running it must exec the restored script and print its output.
-        let out = std::process::Command::new(&packed).output().expect("run SFX");
+        let out = std::process::Command::new(&packed)
+            .output()
+            .expect("run SFX");
         assert!(
             out.status.success(),
             "SFX exited {:?}: stderr={}",
@@ -354,6 +358,115 @@ fn create_sfx_propagates_exit_code_linux() {
         assert_eq!(code, 7, "SFX must propagate the inner program's exit code");
     }
     #[cfg(not(target_os = "linux"))]
+    {}
+}
+
+// ---------------------------------------------------------------------------
+// -c create SFX (macOS only): the three-segment self-extractor
+//   `[ boot sh ][ upxz-loader ][ .upxz ][ trailer ]`. The packed file is a
+//   shell script (the boot segment) and runs unsigned; boot extracts the
+//   loader to a cache dir and execs it, which decompresses and execs the
+//   original. These tests pack a shell script as the app so they are
+//   architecture-independent inside the macOS host.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn create_sfx_runs_packed_script_macos() {
+    #[cfg(target_os = "macos")]
+    {
+        let sb = Sandbox::new("sfx-mac-script");
+        let script = b"#!/bin/sh\necho sfx-mac-ran; exit 0\n";
+        let input = sb.write("hello.sh", script);
+        let packed = sb.expected("hello.packed");
+
+        bin().arg("-c").arg(&input).arg(&packed).assert().success();
+
+        // The SFX must be executable and must be a shell script (boot segment
+        // first), so it runs unsigned.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&packed).unwrap().permissions().mode();
+            assert!(
+                mode & 0o111 != 0,
+                "macOS SFX output is not executable (mode={:o})",
+                mode
+            );
+        }
+
+        let out = std::process::Command::new(&packed)
+            .output()
+            .expect("run macOS SFX");
+        assert!(
+            out.status.success(),
+            "macOS SFX exited {:?}: stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "sfx-mac-ran");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // macOS SFX is macOS-only; nothing to test on other targets.
+    }
+}
+
+#[test]
+fn create_sfx_propagates_exit_code_macos() {
+    #[cfg(target_os = "macos")]
+    {
+        let sb = Sandbox::new("sfx-mac-rc");
+        let script = b"#!/bin/sh\nexit 7\n";
+        let input = sb.write("rc7.sh", script);
+        let packed = sb.expected("rc7.packed");
+
+        bin().arg("-c").arg(&input).arg(&packed).assert().success();
+        let code = std::process::Command::new(&packed)
+            .status()
+            .expect("run macOS SFX")
+            .code()
+            .unwrap_or(-1);
+        assert_eq!(
+            code, 7,
+            "macOS SFX must propagate the inner program's exit code"
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {}
+}
+
+#[test]
+fn create_sfx_forwards_argv_macos() {
+    #[cfg(target_os = "macos")]
+    {
+        let sb = Sandbox::new("sfx-mac-args");
+        // Script echoes its own argv so we can verify forwarding verbatim,
+        // including hyphen-leading args.
+        let script = b"#!/bin/sh\nprintf 'argc=%d argv=%s\\n' \"$#\" \"$*\"\n";
+        let input = sb.write("args.sh", script);
+        let packed = sb.expected("args.packed");
+
+        bin().arg("-c").arg(&input).arg(&packed).assert().success();
+        let out = std::process::Command::new(&packed)
+            .args(["-a", "--long", "val", "quoted arg"])
+            .output()
+            .expect("run macOS SFX");
+        assert!(
+            out.status.success(),
+            "macOS SFX exited {:?}: stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let line = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            line.contains("argc=4"),
+            "expected 4 forwarded args, got: {line}"
+        );
+        assert!(
+            line.contains("-a --long val quoted arg"),
+            "argv not forwarded verbatim: {line}"
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
     {}
 }
 
@@ -399,10 +512,7 @@ fn run_propagates_nonzero_exit_code() {
         bin().arg(&input).assert().success();
         let packed = sb.expected("rc7.sh.upxz");
 
-        bin().arg(&packed)
-            .assert()
-            .failure()
-            .code(predicate::eq(7));
+        bin().arg(&packed).assert().failure().code(predicate::eq(7));
     }
     #[cfg(not(unix))]
     {

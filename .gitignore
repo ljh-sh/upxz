@@ -1,4 +1,5 @@
 /target/
+/loader/target/
 **/*.rs.bk
 *.swp
 *.swo

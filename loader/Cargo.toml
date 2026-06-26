@@ -1,0 +1,54 @@
+[package]
+name = "upxz-loader"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "macOS SFX loader for upxz: no_std zstd decoder that reads a three-segment packed file, decompresses the embedded app, and execs it."
+publish = false
+
+# This binary is `#![no_std]` + `#![no_main]`. We link zstd-sys directly (FFI)
+# instead of the `zstd`/`zstd-safe` wrappers, because those pull Rust std's
+# panic/backtrace machinery back in and balloon the binary to ~338 KB. With
+# no_std + FFI the loader is ~67 KB, well under the 1/5-of-upxz gate.
+# See mneme `docs/upxz/binary-size.md` for the PoC that fixed this decision.
+
+[[bin]]
+name = "upxz-loader"
+path = "src/main.rs"
+
+[dependencies]
+# no_std-compatible: zstd-sys vendors libzstd as a static archive and exposes
+# only the raw C FFI. We never go through `zstd` (the Rust wrapper) here.
+# `default-features = false` drops legacy support and the zdict builder; the
+# `thin-lto` feature compiles libzstd with thin LTO for a smaller decoder.
+# (Matches the PoC configuration in mneme `docs/upxz/binary-size.md`.)
+zstd-sys = { version = "2", default-features = false, features = ["thin-lto"] }
+
+# The crate is binary-only (`[[bin]]` above, no lib target). We deliberately
+# omit `[lib]` — declaring an empty one would make cargo expect `src/lib.rs`.
+
+[profile.release]
+# Aggressive size profile: the loader runs on every packed-binary invocation
+# and is embedded verbatim into every packed file. Smaller is strictly better.
+# `panic = "abort"` is REQUIRED for the no_std panic-handler path to link
+# cleanly on stable (the precompiled core uses unwind; abort at the crate root
+# short-circuits the unwinding tables).
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Recompile all dependencies (notably zstd-sys/libzstd) at opt-level="z" with a
+# single codegen unit, so the decoder tables are as small as possible.
+[profile.release.package."*"]
+opt-level = "z"
+codegen-units = 1
+
+# Force this crate to be its own workspace root (not a member of the parent
+# upxz workspace). The parent workspace's `[profile.release]` lacks
+# `panic = "abort"`; if cargo walked up and found the parent workspace, this
+# crate's `[profile.release]` would be silently ignored and the build would
+# fail with "unwinding panics are not supported without std". An empty
+# `[workspace]` table anchors the crate as standalone.
+[workspace]
