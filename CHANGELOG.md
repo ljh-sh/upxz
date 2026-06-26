@@ -25,11 +25,17 @@ Refs: mneme#41, upxz PR#5 (Linux memfd), #6 (macOS three-part A, superseded), #7
   initial thread/PEB, and it is the technique AV most aggressively flags; see
   `winstub/src/main.rs` and mneme `docs/upxz/windows.md`. The temp-file path
   is the supported Windows mechanism.
-- **Status**: code complete + cross-compile-verified to `x86_64-pc-windows-gnu`;
-  **awaiting real-Windows runtime validation** (develop host is macOS).
+- **Status**: code complete + **cross-compile-verified to
+  `x86_64-pc-windows-gnu`** (`cargo build --release --target
+  x86_64-pc-windows-gnu` succeeds, producing a valid PE32+ `upxz.exe`).
+  **Awaiting real-Windows runtime validation** (develop host is macOS).
   Linux/macOS SFX branches are untouched (`#[cfg]`-isolated); 32 existing
   tests still pass.
-- Refs: mneme `docs/upxz/windows.md`; PR `feat/sfx-windows`.
+- **Build fix**: the recursive `cargo build -p upxz-winstub` in `build.rs`
+  deadlocked in release cross-compile on the workspace package lock; resolved
+  by isolating the recursive build's `CARGO_TARGET_DIR` under `OUT_DIR` and
+  using `TARGET` (not `HOST`) as the winstub build triple.
+- Refs: mneme `docs/upxz/windows.md`; PR #10 (`feat/sfx-windows`).
 
 - **Codec-agnostic container (`--gz`)**: the magic byte at offset 5 now carries
   a codec id — `0` = zstd (default, fully backward-compatible), `1` = gzip. The
