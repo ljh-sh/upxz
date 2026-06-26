@@ -133,11 +133,11 @@ fn normalize_tar_path(p: &str) -> String {
 fn exec_inner(name: &str, bytes: &[u8], trailing: &[String]) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        return exec_memfd_linux(name, bytes, trailing);
+        exec_memfd_linux(name, bytes, trailing)
     }
     #[cfg(target_os = "macos")]
     {
-        return exec_temp_macos(name, bytes, trailing);
+        exec_temp_macos(name, bytes, trailing)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -155,14 +155,35 @@ fn exec_memfd_linux(name: &str, bytes: &[u8], trailing: &[String]) -> Result<()>
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    // memfd_create with a name that is purely advisory. Close-on-exec is set
-    // so the fd does not leak into the child (we use fexecve, which consumes
-    // it during the syscall rather than via /proc/self/fd).
+    // MFD_EXEC (0x10): marks the memfd executable. REQUIRED on Linux 6.3+ under
+    // vm.memfd_noexec=1|2 (the secure default on hardened distros). We do NOT
+    // set MFD_CLOEXEC (see the comment above the memfd_create call below).
+    const MFD_EXEC: u32 = 0x0010;
+
+    // memfd_create with a name that is purely advisory. We deliberately do NOT
+    // set MFD_CLOEXEC: the fexecve primary path consumes the fd during the
+    // syscall, but the /proc/self/fd fallback execve (used on systems where
+    // fexecve is a no-op/ENOSYS) must be able to re-open the memfd after exec,
+    // which CLOEXEC forbids. MFD_EXEC marks it executable on hardened kernels
+    // (vm.memfd_noexec). See the stub crate's `create_exec_memfd` for the full
+    // MFD_EXEC / no-CLOEXEC rationale.
     let mem_name = CString::new("upxz-bin").unwrap();
-    let fd = unsafe { libc::memfd_create(mem_name.as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error()).context("memfd_create failed");
-    }
+    let fd = unsafe { libc::memfd_create(mem_name.as_ptr(), MFD_EXEC) };
+    let fd = if fd >= 0 {
+        fd
+    } else {
+        // Older kernels (< 6.3) do not know MFD_EXEC and return EINVAL; retry
+        // with flags=0 (those kernels default memfds to executable).
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if errno != libc::EINVAL {
+            return Err(std::io::Error::last_os_error()).context("memfd_create failed");
+        }
+        let fd2 = unsafe { libc::memfd_create(mem_name.as_ptr(), 0) };
+        if fd2 < 0 {
+            return Err(std::io::Error::last_os_error()).context("memfd_create failed");
+        }
+        fd2
+    };
     // Wrap the fd so it is closed if any step below fails.
     let owned = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
     let mut written = 0usize;
@@ -209,24 +230,17 @@ fn exec_memfd_linux(name: &str, bytes: &[u8], trailing: &[String]) -> Result<()>
     };
 
     // fexecve is the Linux in-memory exec. On success it does not return.
-    let rc = unsafe { libc::fexecve(fd, argv_p.as_mut_ptr(), envp.as_mut_ptr() as *mut *mut _) };
+    // Signature: fexecve(fd, argv: *const *const c_char, envp: *const *const c_char).
+    let rc = unsafe { libc::fexecve(fd, argv_p.as_ptr(), envp.as_ptr()) };
     let err = std::io::Error::last_os_error();
     let _ = rc;
     // If we reach here, fexecve failed.
     // Workaround for musl/glibc without fexecve: fall back to /proc/self/fd.
     let proc_path = CString::new(format!("/proc/self/fd/{}", fd)).unwrap();
-    let rc2 = unsafe {
-        libc::execve(
-            proc_path.as_ptr(),
-            argv_p.as_mut_ptr(),
-            envp.as_mut_ptr() as *mut _,
-        )
-    };
+    let rc2 = unsafe { libc::execve(proc_path.as_ptr(), argv_p.as_ptr(), envp.as_ptr()) };
     let err2 = std::io::Error::last_os_error();
     let _ = rc2;
-    bail!(
-        "fexecve failed ({err}); /proc/self/fd fallback also failed ({err2})"
-    );
+    bail!("fexecve failed ({err}); /proc/self/fd fallback also failed ({err2})");
 }
 
 // ---------------------------------------------------------------------------

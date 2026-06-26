@@ -14,6 +14,7 @@
 //! Linux, and (later) Windows with one container format.
 
 mod bin_run;
+mod compress;
 mod format;
 mod level;
 mod sfx;
@@ -24,7 +25,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::format::{check_packable_input, has_magic, parse_header, sanitize_name, Header, MAGIC};
+use crate::format::{
+    check_packable_input, has_magic, parse_header, sanitize_name, Codec, Header, MAGIC,
+};
 use crate::level::LevelArgs;
 
 #[derive(Parser, Debug)]
@@ -70,7 +73,12 @@ struct Cli {
     /// Output path for `-c` (the SFX file). Required when `-c` is set. Kept as
     /// an option (not a second positional) so that `run`/`--bin` trailing args
     /// after `--` are not swallowed by a positional slot — see `ARGS` below.
-    #[arg(short = 'o', long = "out", value_name = "PACKED", requires = "create_sfx")]
+    #[arg(
+        short = 'o',
+        long = "out",
+        value_name = "PACKED",
+        requires = "create_sfx"
+    )]
     sfx_output: Option<PathBuf>,
 
     /// Decompress / restore a .upxz container to its original file.
@@ -121,7 +129,7 @@ fn main() -> Result<()> {
         let out = cli
             .sfx_output
             .ok_or_else(|| anyhow::anyhow!("-c requires an output path"))?;
-        return pack_sfx(&cli.file, &out, cli.level.resolve(), cli.force, cli.quiet);
+        return pack_sfx(&cli.file, &out, &cli.level, cli.force, cli.quiet);
     }
     if cli.list {
         return list(&cli.file);
@@ -137,7 +145,7 @@ fn main() -> Result<()> {
     if has_magic(&head) {
         run(&cli.file, cli.quiet, &cli.trailing)
     } else {
-        pack(&cli.file, cli.level.resolve(), cli.force, cli.quiet)
+        pack(&cli.file, &cli.level, cli.force, cli.quiet)
     }
 }
 
@@ -169,13 +177,18 @@ fn read_head(path: &Path, n: usize) -> Result<Vec<u8>> {
     Ok(head)
 }
 
-fn pack(input: &Path, zstd_level: i32, force: bool, quiet: bool) -> Result<()> {
+fn pack(input: &Path, level: &LevelArgs, force: bool, quiet: bool) -> Result<()> {
     let raw = read_input_file(input)?;
     check_packable_input(&raw)?; // refuse double-pack
 
     let name = sanitize_name(input)?;
-    let payload = zstd::encode_all(raw.as_slice(), zstd_level)
-        .with_context(|| format!("zstd compression failed at level {zstd_level}"))?;
+    let codec = level.codec();
+    let lvl = match codec {
+        Codec::Zstd => level.resolve(),
+        Codec::Gzip => level.gzip_level() as i32,
+    };
+    let payload = compress::compress(codec, &raw, lvl)
+        .with_context(|| format!("{codec} compression failed"))?;
 
     let out_path = default_pack_output(input);
     if out_path.exists() && !force {
@@ -184,7 +197,7 @@ fn pack(input: &Path, zstd_level: i32, force: bool, quiet: bool) -> Result<()> {
             out_path.display()
         );
     }
-    let header_bytes = Header { name }.encode();
+    let header_bytes = Header { name, codec }.encode();
     let mut out = fs::File::create(&out_path)
         .with_context(|| format!("cannot create output {}", out_path.display()))?;
     out.write_all(&header_bytes)
@@ -195,12 +208,13 @@ fn pack(input: &Path, zstd_level: i32, force: bool, quiet: bool) -> Result<()> {
 
     if !quiet {
         eprintln!(
-            "packed {} -> {} ({} -> {} bytes, zstd {})",
+            "packed {} -> {} ({} -> {} bytes, {} {})",
             input.display(),
             out_path.display(),
             raw.len(),
             header_bytes.len() + payload.len(),
-            zstd_level
+            codec.name(),
+            lvl
         );
     }
     Ok(())
@@ -209,8 +223,7 @@ fn pack(input: &Path, zstd_level: i32, force: bool, quiet: bool) -> Result<()> {
 fn unpack(input: &Path, force: bool, quiet: bool) -> Result<()> {
     let buf = read_input_file(input)?;
     let (header, payload_offset) = parse_header(&buf)?;
-    let restored = zstd::decode_all(&buf[payload_offset..])
-        .context("zstd decompression failed; container may be corrupt")?;
+    let restored = compress::decompress(header.codec, &buf[payload_offset..])?;
 
     let out_path = unpack_output(input, &header.name)?;
     if out_path.exists() && !force {
@@ -252,8 +265,7 @@ fn unpack(input: &Path, force: bool, quiet: bool) -> Result<()> {
 fn run(file: &Path, quiet: bool, trailing: &[String]) -> Result<()> {
     let buf = read_input_file(file)?;
     let (header, payload_offset) = parse_header(&buf)?;
-    let original = zstd::decode_all(&buf[payload_offset..])
-        .context("zstd decompression failed; container may be corrupt")?;
+    let original = compress::decompress(header.codec, &buf[payload_offset..])?;
 
     let tmp = std::env::temp_dir().join(format!(
         ".upxz-run-{}-{}",
@@ -323,14 +335,29 @@ fn run(file: &Path, quiet: bool, trailing: &[String]) -> Result<()> {
 ///
 /// On other targets `pack_sfx` refuses with an explicit error rather than
 /// producing a non-functional artifact.
-fn pack_sfx(input: &Path, output: &Path, zstd_level: i32, force: bool, quiet: bool) -> Result<()> {
+fn pack_sfx(
+    input: &Path,
+    output: &Path,
+    level: &LevelArgs,
+    force: bool,
+    quiet: bool,
+) -> Result<()> {
     let raw = read_input_file(input)?;
     check_packable_input(&raw)?; // refuse double-pack
     let name = sanitize_name(input)?;
 
-    let payload = zstd::encode_all(raw.as_slice(), zstd_level)
-        .with_context(|| format!("zstd compression failed at level {zstd_level}"))?;
-    let header_bytes = Header { name: name.clone() }.encode();
+    let codec = level.codec();
+    let lvl = match codec {
+        Codec::Zstd => level.resolve(),
+        Codec::Gzip => level.gzip_level() as i32,
+    };
+    let payload = compress::compress(codec, raw.as_slice(), lvl)
+        .with_context(|| format!("{codec} compression failed"))?;
+    let header_bytes = Header {
+        name: name.clone(),
+        codec,
+    }
+    .encode();
 
     if output.exists() && !force {
         bail!(
@@ -339,12 +366,27 @@ fn pack_sfx(input: &Path, output: &Path, zstd_level: i32, force: bool, quiet: bo
         );
     }
 
+    // The macOS two-segment loader is no_std + zstd-sys FFI only (size gate:
+    // < 1/5 of upxz, < 100 KB). It cannot decode gzip. Refuse gzip SFX on
+    // macOS rather than emit a packed file the loader cannot run. The Linux
+    // stub and the cross-platform runner path support gzip fully.
+    #[cfg(target_os = "macos")]
+    {
+        if codec == Codec::Gzip {
+            bail!(
+                "gzip SFX is not supported on macOS: the no_std loader is zstd-only for size. \
+                 Use the runner path (`upxz run foo.upxz`) or pack with zstd (drop --gz)."
+            );
+        }
+    }
+
     #[cfg(target_os = "linux")]
     {
         pack_sfx_linux(
             input,
             output,
-            zstd_level,
+            codec,
+            lvl,
             quiet,
             &raw,
             &header_bytes,
@@ -356,7 +398,8 @@ fn pack_sfx(input: &Path, output: &Path, zstd_level: i32, force: bool, quiet: bo
         pack_sfx_macos(
             input,
             output,
-            zstd_level,
+            codec,
+            lvl,
             quiet,
             &raw,
             &header_bytes,
@@ -368,7 +411,8 @@ fn pack_sfx(input: &Path, output: &Path, zstd_level: i32, force: bool, quiet: bo
         let _ = (
             input,
             output,
-            zstd_level,
+            codec,
+            lvl,
             quiet,
             &raw,
             &header_bytes,
@@ -380,10 +424,12 @@ fn pack_sfx(input: &Path, output: &Path, zstd_level: i32, force: bool, quiet: bo
 
 /// Linux SFX: `[ stub ][ .upxz container ][ trailer: u64 stub_size BE ]`.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)] // 8 args: all are distinct inputs the SFX layout needs.
 fn pack_sfx_linux(
     input: &Path,
     output: &Path,
-    zstd_level: i32,
+    codec: Codec,
+    level: i32,
     quiet: bool,
     raw: &[u8],
     header_bytes: &[u8],
@@ -419,14 +465,15 @@ fn pack_sfx_linux(
     if !quiet {
         let total = stub.len() + header_bytes.len() + payload.len() + 8;
         eprintln!(
-            "sfx {} -> {} ({} -> {} bytes; stub {}, payload {}, zstd {})",
+            "sfx {} -> {} ({} -> {} bytes; stub {}, payload {}, {} {})",
             input.display(),
             output.display(),
             raw.len(),
             total,
             stub.len(),
             payload.len(),
-            zstd_level
+            codec.name(),
+            level
         );
     }
     Ok(())
@@ -450,10 +497,12 @@ fn pack_sfx_linux(
 /// ad-hoc codesigns that, and `execv`s it. See mneme `docs/upxz/` for the full
 /// design and the codesign-decision trade-off.
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)] // 8 args: all are distinct inputs the SFX layout needs.
 fn pack_sfx_macos(
     input: &Path,
     output: &Path,
-    zstd_level: i32,
+    codec: Codec,
+    level: i32,
     quiet: bool,
     raw: &[u8],
     header_bytes: &[u8],
@@ -504,14 +553,15 @@ fn pack_sfx_macos(
     if !quiet {
         let total = loader.len() + header_bytes.len() + payload.len() + trailer.len();
         eprintln!(
-            "sfx {} -> {} ({} -> {} bytes; loader {}, payload {}, zstd {})",
+            "sfx {} -> {} ({} -> {} bytes; loader {}, payload {}, {} {})",
             input.display(),
             output.display(),
             raw.len(),
             total,
             loader.len(),
             payload.len(),
-            zstd_level
+            codec.name(),
+            level
         );
     }
     Ok(())
@@ -520,8 +570,8 @@ fn pack_sfx_macos(
 fn list(file: &Path) -> Result<()> {
     let buf = read_input_file(file)?;
     let (header, payload_offset) = parse_header(&buf)?;
-    let original =
-        zstd::decode_all(&buf[payload_offset..]).context("decompression failed while listing")?;
+    let original = compress::decompress(header.codec, &buf[payload_offset..])
+        .context("decompression failed while listing")?;
     let ratio = if original.is_empty() {
         0.0
     } else {
@@ -529,7 +579,7 @@ fn list(file: &Path) -> Result<()> {
     };
     println!("file\t{}", file.display());
     println!("magic\tUPXZ (upxz container)");
-    println!("codec\tzstd");
+    println!("codec\t{}", header.codec.name());
     println!("name\t{}", header.name);
     println!("compressed\t{} bytes", buf.len());
     println!("original\t{} bytes", original.len());
@@ -540,10 +590,12 @@ fn list(file: &Path) -> Result<()> {
 fn test(file: &Path) -> Result<()> {
     let buf = read_input_file(file)?;
     let (header, payload_offset) = parse_header(&buf)?;
-    zstd::decode_all(&buf[payload_offset..]).context("decompression test failed")?;
+    compress::decompress(header.codec, &buf[payload_offset..])
+        .context("decompression test failed")?;
     println!(
-        "ok\t{} (magic valid, zstd round-trip ok, original name {})",
+        "ok\t{} (magic valid, {} round-trip ok, original name {})",
         file.display(),
+        header.codec.name(),
         header.name
     );
     Ok(())
@@ -605,13 +657,13 @@ mod tests {
         std::fs::write(&in_path, &body).unwrap();
 
         let packed = dir.join("hello.txt.upxz");
-        pack(&in_path, 19, false, true).unwrap();
+        pack(&in_path, &LevelArgs::default(), false, true).unwrap();
         assert!(packed.is_file());
         let packed_bytes = std::fs::read(&packed).unwrap();
         assert_eq!(&packed_bytes[..MAGIC.len()], &MAGIC[..]);
 
         // refuse double-pack
-        assert!(pack(&packed, 19, false, true).is_err());
+        assert!(pack(&packed, &LevelArgs::default(), false, true).is_err());
 
         // unpack default strips .upxz -> restores to "hello.txt" next to it.
         // pack keeps the original, so it still exists and must be overwritten.
@@ -619,6 +671,49 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("hello.txt")).unwrap(), body);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pack_gzip_then_unpack_roundtrips() {
+        // --gz: the codec byte in the magic must be 1, and the round-trip
+        // through gzip (flate2 / miniz_oxide) must restore the original.
+        let dir = tmpdir("rt-gz");
+        let in_path = dir.join("hello.txt");
+        let body = b"hello upxz gzip\n".repeat(64);
+        std::fs::write(&in_path, &body).unwrap();
+
+        let gz_args = LevelArgs {
+            gzip: true,
+            ..LevelArgs::default()
+        };
+        let packed = dir.join("hello.txt.upxz");
+        pack(&in_path, &gz_args, false, true).unwrap();
+        assert!(packed.is_file());
+        let packed_bytes = std::fs::read(&packed).unwrap();
+        // codec byte at offset 5 must be 1 (gzip); prefix is UPXZ\x01.
+        assert_eq!(&packed_bytes[..5], b"UPXZ\x01");
+        assert_eq!(packed_bytes[5], 1, "gzip codec byte must be 1");
+        assert_eq!(packed_bytes[6], 0);
+        assert_eq!(packed_bytes[7], 0);
+
+        unpack(&packed, true, true).unwrap();
+        assert_eq!(std::fs::read(dir.join("hello.txt")).unwrap(), body);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_header_reads_gzip_codec() {
+        // A header written with codec=Gzip must parse back as codec=Gzip.
+        let h = Header {
+            name: "x.bin".to_owned(),
+            codec: Codec::Gzip,
+        };
+        let bytes = h.encode();
+        let (parsed, off) = parse_header(&bytes).unwrap();
+        assert_eq!(parsed.codec, Codec::Gzip);
+        assert_eq!(parsed.name, "x.bin");
+        assert_eq!(off, bytes.len()); // payload starts right after the header
     }
 
     #[test]

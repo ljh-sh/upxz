@@ -63,12 +63,43 @@ upxz exposes zstd as three named presets rather than a raw `--level=N` knob:
 
 `--fast` and `--best` are mutually exclusive.
 
-## Why zstd only (no xz / liblzma)
+### Codec: zstd (default) or gzip (`--gz`)
 
-`upxz` does not depend on `xz2` / `liblzma`. The container compresses with zstd
-only, so the build stays a single binary with a permissive license story
-(Apache-2.0 project + BSD-licensed zstd bindings) and no LGPL entanglement.
-See [`DESIGN.md`](DESIGN.md) for the full rationale.
+The container is **codec-agnostic**: a single byte in the magic records which
+codec compressed the payload, so one `upxz` binary handles both.
+
+| codec | magic byte | flag      | level range            |
+| ----- | ---------- | --------- | ---------------------- |
+| zstd  | `0`        | _(none)_  | 1..=19 (default 19)    |
+| gzip  | `1`        | `--gz`    | 1..=9 (default 9)      |
+
+```bash
+# pack with gzip instead of zstd
+upxz --gz notes.txt              # -> notes.txt.upxz (codec id 1 in the magic)
+
+# zstd is still the default and is fully backward-compatible
+upxz notes.txt                   # -> notes.txt.upxz (codec id 0, same as v0.2)
+```
+
+Every read path (run / unpack / list / test) dispatches on the codec byte, so
+you do not need to tell `upxz` which codec a container used — it reads it from
+the magic. The gzip backend is `flate2` with the pure-Rust `miniz_oxide`
+backend (no C `libz`); zstd is unchanged.
+
+**macOS SFX caveat**: the macOS SFX loader is `no_std` + `zstd-sys` FFI for
+size (~84 KB, under the 1/5-of-upxz gate). It cannot carry a gzip decoder, so
+`upxz -c --gz` on macOS refuses with a clear message. Use the cross-platform
+runner path (`upxz foo.upxz`) for gzip on macOS, or pack with zstd (drop
+`--gz`). The Linux SFX stub supports both codecs.
+
+## Why zstd-first (no xz / liblzma)
+
+`upxz` does not depend on `xz2` / `liblzma`. zstd is the default codec so the
+build stays a single binary with a permissive license story (Apache-2.0 project
++ BSD-licensed zstd bindings) and no LGPL entanglement. gzip is offered as an
+opt-in (`--gz`) via the pure-Rust `miniz_oxide` backend for tooling that
+already speaks gzip; it never adds a C dependency. See [`DESIGN.md`](DESIGN.md)
+for the full rationale.
 
 ## Self-extracting binaries (`-c` / `--create-sfx`)
 
@@ -100,7 +131,7 @@ echo $?                     # myapp's exit code
 Layout:
 
 ```
-[ stub ELF ][ .upxz container (magic+namelen+name+zstd) ][ u64 stub_size BE ]
+[ stub ELF ][ .upxz container (magic+namelen+name+compressed payload) ][ u64 stub_size BE ]
 ```
 
 The stub (`stub/` crate) reads `/proc/self/exe`, recovers `stub_size` from the

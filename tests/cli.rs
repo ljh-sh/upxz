@@ -6,7 +6,7 @@
 //! - pack  : `upxz <file>`           -> writes `<file>.upxz`
 //! - run   : `upxz <file>.upxz`      -> decompress + exec (propagates exit code)
 //! - --bin : `upxz --bin <inner> <a.tar.zst> -- args` -> stream-extract one
-//!           entry from a .tar.zst and exec it (no full extraction)
+//!   entry from a .tar.zst and exec it (no full extraction)
 //! - -d    : unpack, byte-for-byte round-trip
 //! - -l/-t : list / test, exit 0 + expected fields
 //! - level : `--fast`, `-z N`, default — all must produce a valid container
@@ -305,7 +305,13 @@ fn create_sfx_runs_packed_script_linux() {
         let input = sb.write("hello.sh", script);
         let packed = sb.expected("hello.packed");
 
-        bin().arg("-c").arg(&input).arg("-o").arg(&packed).assert().success();
+        bin()
+            .arg("-c")
+            .arg(&input)
+            .arg("-o")
+            .arg(&packed)
+            .assert()
+            .success();
 
         // The SFX must be executable.
         #[cfg(unix)]
@@ -346,7 +352,13 @@ fn create_sfx_propagates_exit_code_linux() {
         let input = sb.write("rc7.sh", script);
         let packed = sb.expected("rc7.packed");
 
-        bin().arg("-c").arg(&input).arg("-o").arg(&packed).assert().success();
+        bin()
+            .arg("-c")
+            .arg(&input)
+            .arg("-o")
+            .arg(&packed)
+            .assert()
+            .success();
         std::process::Command::new(&packed)
             .status()
             .expect("run SFX")
@@ -382,7 +394,13 @@ fn create_sfx_runs_packed_script_macos() {
         let input = sb.write("hello.sh", script);
         let packed = sb.expected("hello.packed");
 
-        bin().arg("-c").arg(&input).arg("-o").arg(&packed).assert().success();
+        bin()
+            .arg("-c")
+            .arg(&input)
+            .arg("-o")
+            .arg(&packed)
+            .assert()
+            .success();
 
         // The SFX must be executable. Its Mach-O header IS the loader
         // (codesigned), so `./packed` execs the loader directly.
@@ -422,7 +440,13 @@ fn create_sfx_propagates_exit_code_macos() {
         let input = sb.write("rc7.sh", script);
         let packed = sb.expected("rc7.packed");
 
-        bin().arg("-c").arg(&input).arg("-o").arg(&packed).assert().success();
+        bin()
+            .arg("-c")
+            .arg(&input)
+            .arg("-o")
+            .arg(&packed)
+            .assert()
+            .success();
         let code = std::process::Command::new(&packed)
             .status()
             .expect("run macOS SFX")
@@ -448,7 +472,13 @@ fn create_sfx_forwards_argv_macos() {
         let input = sb.write("args.sh", script);
         let packed = sb.expected("args.packed");
 
-        bin().arg("-c").arg(&input).arg("-o").arg(&packed).assert().success();
+        bin()
+            .arg("-c")
+            .arg(&input)
+            .arg("-o")
+            .arg(&packed)
+            .assert()
+            .success();
         let out = std::process::Command::new(&packed)
             .args(["-a", "--long", "val", "quoted arg"])
             .output()
@@ -546,10 +576,7 @@ fn run_forwards_trailing_args_after_dash_dash() {
             .assert()
             .success();
         let s = String::from_utf8_lossy(&out.get_output().stdout);
-        assert!(
-            s.contains("argc=4|"),
-            "expected 4 forwarded args, got: {s}"
-        );
+        assert!(s.contains("argc=4|"), "expected 4 forwarded args, got: {s}");
         assert!(
             s.contains("first -flag with space --long=1"),
             "args not forwarded verbatim: {s}"
@@ -582,10 +609,9 @@ fn build_tar_zst(src_dir: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
         .arg(".")
         .status()?;
     if !st.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("tar exited {st:?}; is tar on PATH?"),
-        ));
+        return Err(std::io::Error::other(format!(
+            "tar exited {st:?}; is tar on PATH?"
+        )));
     }
     // zstd -19 -f tmp.tar -o dst
     let st = Command::new("zstd")
@@ -595,10 +621,9 @@ fn build_tar_zst(src_dir: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
         .arg(dst)
         .status()?;
     if !st.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("zstd exited {st:?}; is zstd on PATH?"),
-        ));
+        return Err(std::io::Error::other(format!(
+            "zstd exited {st:?}; is zstd on PATH?"
+        )));
     }
     let _ = fs::remove_file(&tmp_tar);
     Ok(())
@@ -641,14 +666,8 @@ fn bin_runs_inner_entry_and_forwards_argv() {
             .failure()
             .code(predicate::eq(42));
         let s = String::from_utf8_lossy(&out.get_output().stdout);
-        assert!(
-            s.contains("argc=3|"),
-            "expected 3 forwarded args, got: {s}"
-        );
-        assert!(
-            s.contains("one two -x"),
-            "argv not forwarded verbatim: {s}"
-        );
+        assert!(s.contains("argc=3|"), "expected 3 forwarded args, got: {s}");
+        assert!(s.contains("one two -x"), "argv not forwarded verbatim: {s}");
 
         // The decoy must not have been written next to the archive (we only
         // materialize the matched inner entry, into a temp / memfd).
@@ -671,11 +690,7 @@ fn bin_matches_entry_with_leading_dot_slash() {
     {
         let src = sb.dir.join("src");
         fs::create_dir_all(src.join("bin")).unwrap();
-        fs::write(
-            src.join("bin").join("hi"),
-            b"#!/bin/sh\necho ran-inner\n",
-        )
-        .unwrap();
+        fs::write(src.join("bin").join("hi"), b"#!/bin/sh\necho ran-inner\n").unwrap();
         let archive = sb.dir.join("b.tar.zst");
         if build_tar_zst(&src, &archive).is_err() {
             eprintln!("skipping bin_matches_entry_with_leading_dot_slash: tar/zstd unavailable");
@@ -723,4 +738,131 @@ fn bin_missing_entry_errors() {
     {
         let _ = sb;
     }
+}
+
+// ---------------------------------------------------------------------------
+// codec-agnostic: --gz selects gzip (codec id 1 in the magic). The whole
+// read path (run / unpack / list / test) must dispatch by the codec byte, and
+// a zstd container (codec id 0) must still round-trip (backward compat).
+// ---------------------------------------------------------------------------
+
+fn assert_has_gzip_magic(path: &PathBuf) {
+    let bytes = fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    assert!(bytes.len() >= 8, "{} too small", path.display());
+    assert_eq!(&bytes[..5], b"UPXZ\x01", "magic prefix wrong");
+    assert_eq!(
+        bytes[5],
+        1,
+        "codec byte must be 1 (gzip) in {}",
+        path.display()
+    );
+    assert_eq!(bytes[6], 0, "reserved byte 6 must be 0");
+    assert_eq!(bytes[7], 0, "reserved byte 7 must be 0");
+}
+
+#[test]
+fn pack_gz_writes_gzip_magic() {
+    let sb = Sandbox::new("pack-gz-magic");
+    let input = sb.write("hello.txt", b"hello upxz gzip\n".repeat(64).as_slice());
+    let expected = sb.expected("hello.txt.upxz");
+
+    bin().arg("--gz").arg(&input).assert().success();
+
+    assert!(expected.is_file());
+    assert_has_gzip_magic(&expected);
+}
+
+#[test]
+fn pack_gz_unpack_roundtrips_bytes() {
+    let sb = Sandbox::new("pack-gz-rt");
+    let body = b"the gzip round trip\n".repeat(50);
+    let input = sb.write("payload.bin", &body);
+
+    bin().arg("--gz").arg(&input).assert().success();
+    let packed = sb.expected("payload.bin.upxz");
+    assert_has_gzip_magic(&packed);
+
+    // Unpack must restore byte-for-byte through the gzip codec path.
+    bin().arg("-d").arg(&packed).arg("-f").assert().success();
+    assert_eq!(fs::read(sb.expected("payload.bin")).unwrap(), body);
+}
+
+#[test]
+fn pack_gz_test_reports_gzip() {
+    let sb = Sandbox::new("pack-gz-test");
+    let input = sb.write("data.bin", b"abc".repeat(100).as_slice());
+    bin().arg("--gz").arg(&input).assert().success();
+    let packed = sb.expected("data.bin.upxz");
+
+    bin().arg("-t").arg(&packed).assert().success().stdout(
+        predicate::str::contains("ok\t")
+            .and(predicate::str::contains("gzip round-trip ok"))
+            .and(predicate::str::contains("data.bin")),
+    );
+}
+
+#[test]
+fn pack_gz_list_shows_gzip_codec() {
+    let sb = Sandbox::new("pack-gz-list");
+    let input = sb.write("note.txt", b"hello world\n".repeat(16).as_slice());
+    bin().arg("--gz").arg(&input).assert().success();
+    let packed = sb.expected("note.txt.upxz");
+
+    bin().arg("-l").arg(&packed).assert().success().stdout(
+        predicate::str::contains("magic\tUPXZ").and(predicate::str::contains("codec\tgzip")),
+    );
+}
+
+#[test]
+fn pack_gz_runs_packed_script() {
+    // The runner path (upxz <file>.upxz) must dispatch on the codec byte and
+    // exec the gzip-decompressed original. We pack a shell script with --gz.
+    let sb = Sandbox::new("pack-gz-run");
+    #[cfg(unix)]
+    {
+        let script = b"#!/bin/sh\necho gz-ran; exit 0\n";
+        let input = sb.write("hello.sh", script);
+
+        bin().arg("--gz").arg(&input).assert().success();
+        let packed = sb.expected("hello.sh.upxz");
+        assert_has_gzip_magic(&packed);
+
+        // Resolve the freshly-built upxz binary the way assert_cmd does, so the
+        // test works under both `cargo test` (debug) and `cargo test --release`.
+        let upxz_bin = assert_cmd::cargo::cargo_bin("upxz");
+        let out = std::process::Command::new(upxz_bin)
+            .arg(&packed)
+            .output()
+            .unwrap_or_else(|e| panic!("run upxz: {e}"));
+        assert!(
+            out.status.success(),
+            "upxz run exited {:?}: stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "gz-ran");
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sb;
+    }
+}
+
+#[test]
+fn backcompat_zstd_container_still_works_after_codec_aware_build() {
+    // A container packed WITHOUT --gz must still use codec id 0 (zstd) and
+    // round-trip through the new codec-aware unpacker. This is the regression
+    // guard for "did we break the v0.1/v0.2 format?".
+    let sb = Sandbox::new("backcompat");
+    let body = b"backward compat zstd bytes\n".repeat(40);
+    let input = sb.write("old.bin", &body);
+
+    bin().arg(&input).assert().success(); // no --gz => zstd
+    let packed = sb.expected("old.bin.upxz");
+    let bytes = fs::read(&packed).unwrap();
+    assert_eq!(&bytes[..5], b"UPXZ\x01");
+    assert_eq!(bytes[5], 0, "default pack must write codec id 0 (zstd)");
+
+    bin().arg("-d").arg(&packed).arg("-f").assert().success();
+    assert_eq!(fs::read(sb.expected("old.bin")).unwrap(), body);
 }
