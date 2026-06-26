@@ -44,6 +44,7 @@ const TRAILER_LEN: usize = 8;
 ///   - On kernels older than 6.3 the `MFD_EXEC` flag is unknown and
 ///     `memfd_create` returns `EINVAL`; we retry with flags=0 (those kernels
 ///     default memfds to executable, which is what we want).
+///
 /// See `memfd_create(2)` and `Documentation/userspace-api/mfd_noexec.rst`.
 const MFD_EXEC: u32 = 0x0010;
 
