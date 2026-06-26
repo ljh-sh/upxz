@@ -165,10 +165,27 @@ fn build_windows_stub(out_dir: &Path) {
     let linux_stub_path = out_dir.join("upxz-stub.bin");
     let loader_path = out_dir.join("upxz-loader.bin");
 
-    // Build the winstub as a release artifact targeting the host triple.
-    // Release because the stub runs on every SFX invocation: size + speed
-    // matter, and a stripped optimized stub is much smaller than a debug one.
-    let target = env::var("HOST").expect("HOST set by Cargo");
+    // Build the winstub as a release artifact targeting the TARGET triple
+    // (NOT HOST). When upxz is cross-compiled to Windows from a non-Windows
+    // host (e.g. `cargo build --target x86_64-pc-windows-gnu` on macOS/Linux),
+    // HOST is the macOS/Linux triple and TARGET is the Windows triple; we must
+    // build the winstub for the Windows target so it can be embedded into a
+    // Windows-packed file. `TARGET` is the env var Cargo sets to the triple
+    // being built for. (The sibling Linux `build_linux_stub` uses HOST because
+    // it is only reached when target_os == linux, where HOST == TARGET in the
+    // common native-build case; we use TARGET here to support cross-compile.)
+    let target = env::var("TARGET").expect("TARGET set by Cargo");
+
+    // Use a SEPARATE target dir for the recursive winstub build. Cargo build
+    // scripts that recursively invoke `cargo build` against the SAME workspace
+    // can deadlock on the workspace package lock (the child waits for the lock
+    // the parent already holds). Redirecting the child's output to an isolated
+    // dir (under OUT_DIR, which is unique per build) sidesteps the lock
+    // entirely. This is the documented workaround for build-script recursion.
+    let stub_target_dir = out_dir.join("winstub-target");
+    std::fs::create_dir_all(&stub_target_dir)
+        .expect("create isolated target dir for winstub build");
+
     let status = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()))
         .args([
             "build",
@@ -178,40 +195,31 @@ fn build_windows_stub(out_dir: &Path) {
             "--target",
             &target,
         ])
+        // Isolate the recursive build's target dir so it does NOT share the
+        // parent workspace's package lock (avoids the build-script recursion
+        // deadlock). The artifact lands under this dir.
+        .env("CARGO_TARGET_DIR", &stub_target_dir)
         .status()
         .expect("failed to invoke `cargo build -p upxz-winstub`");
     if !status.success() {
         panic!("building upxz-winstub failed (exit {:?})", status.code());
     }
 
-    // Locate the produced binary. With an explicit `--target`, the artifact is
-    // under `target/<triple>/release/`. The winstub binary has a `.exe`
-    // suffix on Windows hosts and no suffix elsewhere (the cross-compile case
-    // still names it `upxz-winstub` with no extension in `target/`, because
-    // cargo does not append `.exe` unless the *host* is Windows).
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let artifact = manifest_dir
-        .join("target")
+    // Locate the produced binary. With an explicit `--target` AND a custom
+    // CARGO_TARGET_DIR, the artifact is under
+    // `<stub_target_dir>/<triple>/release/upxz-winstub(.exe)`. The winstub
+    // binary has a `.exe` suffix when the TARGET is Windows (the only case
+    // this branch is reached), regardless of the host.
+    let artifact = stub_target_dir
         .join(&target)
         .join("release")
         .join(winstub_binary_name());
-    let artifact = if artifact.is_file() {
-        artifact
-    } else {
-        // Fall back to the no-target path in case the caller overrode target-dir.
-        let alt = manifest_dir
-            .join("target")
-            .join("release")
-            .join(winstub_binary_name());
-        if !alt.is_file() {
-            panic!(
-                "upxz-winstub binary not found at {} (nor {})",
-                artifact.display(),
-                alt.display()
-            );
-        }
-        alt
-    };
+    if !artifact.is_file() {
+        panic!(
+            "upxz-winstub binary not found at {} after build",
+            artifact.display()
+        );
+    }
     std::fs::copy(&artifact, &stub_path).expect("copy winstub to OUT_DIR");
 
     // Empty placeholders for the other platforms so `include_bytes!` compiles.
