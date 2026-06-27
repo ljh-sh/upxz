@@ -37,6 +37,37 @@ use std::process::Command;
 fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR set by Cargo"));
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+
+    // Detect whether the SFX companion-crate sources are present. A `cargo
+    // publish` tarball strips nested-package directories (any subtree
+    // containing a sibling Cargo.toml), so `stub/`, `loader/`, `winstub/` are
+    // absent when building from crates.io — we then cannot compile the SFX
+    // stubs. In that case emit empty placeholders (so `include_bytes!` still
+    // compiles) and warn: upxz works fully as a runner/packer, but `upxz -c`
+    // (SFX) refuses at runtime. Building from git (`cargo install --git`) or
+    // a GitHub release binary ships the companions and gives full SFX. See
+    // issue #11 and README "Installation".
+    if !companions_present(&manifest_dir) {
+        emit_empty_placeholders(&out_dir);
+        println!(
+            "cargo:warning=upxz: SFX companion sources not found in this source tree \
+             (likely a stripped crates.io tarball)."
+        );
+        println!(
+            "cargo:warning=upxz: pack / run / --bin / list / test work normally, but \
+             `upxz -c` (self-extracting binary) is NOT available in this build."
+        );
+        println!(
+            "cargo:warning=upxz: for SFX, install from source \
+             (`cargo install --git https://github.com/ljh-sh/upxz`) or download a \
+             release binary from https://github.com/ljh-sh/upxz/releases."
+        );
+        // Still rerun on build.rs/Cargo.toml changes.
+        println!("cargo:rerun-if-changed=build.rs");
+        println!("cargo:rerun-if-changed=Cargo.toml");
+        return;
+    }
 
     match target_os.as_str() {
         "linux" => build_linux_stub(&out_dir),
@@ -48,6 +79,19 @@ fn main() {
     // Common rerun triggers.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
+}
+
+/// Whether the SFX companion-crate sources are present in the source tree.
+/// They are in a git checkout (or `cargo install --git`); they are stripped
+/// from a `cargo publish` tarball (nested-package directories are dropped).
+fn companions_present(manifest_dir: &Path) -> bool {
+    [
+        "stub/src/main.rs",
+        "loader/src/main.rs",
+        "winstub/src/main.rs",
+    ]
+    .iter()
+    .all(|rel| manifest_dir.join(rel).is_file())
 }
 
 /// Linux: build `upxz-stub` (workspace member) and copy its binary into

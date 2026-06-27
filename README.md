@@ -28,12 +28,20 @@ Two subcommands:
 ## Install
 
 ```bash
-# from source
+# from source — full feature set including SFX (`-c`)
 cargo install --git https://github.com/ljh-sh/upxz
 
-# or download a prebuilt binary from releases
+# or download a prebuilt, signed binary from releases
 # https://github.com/ljh-sh/upxz/releases
 ```
+
+> **`cargo install upxz` (from crates.io) gives the runner/packer but not SFX.**
+> A `cargo publish` tarball strips the nested SFX companion crates
+> (`stub/`/`loader/`/`winstub/`), so the self-extracting-binary feature
+> (`-c`/`--create-sfx`) cannot be compiled from a crates.io install — `upxz -c`
+> refuses with a clear message. Pack / run / `--bin` / list / test all work.
+> For SFX, use one of the two commands above (both ship the full source).
+> Tracked in [#11](https://github.com/ljh-sh/upxz/issues/11).
 
 ## Usage
 
