@@ -29,6 +29,13 @@ use crate::format::Codec;
 /// - gzip: 1..=9 (0 = store / no compression is rejected by callers).
 pub fn compress(codec: Codec, raw: &[u8], level: i32) -> Result<Vec<u8>> {
     match codec {
+        // `encode_all` uses the zstd crate's default `Encoder`, which writes
+        // the **content checksum** (xxhash32 of the original) by default —
+        // matching the `zstd` CLI. libzstd verifies it on every decode, so
+        // `-t` / unpack / run are true integrity checks: a corrupted payload
+        // fails decode rather than yielding wrong-but-"ok" bytes. (The no_std
+        // macOS loader's `ZSTD_decompressDCtx` verifies it transparently too.)
+        // `test_rejects_corrupted_payload` guards this behavior.
         Codec::Zstd => zstd::encode_all(raw, level)
             .with_context(|| format!("zstd compression failed at level {level}")),
         Codec::Gzip => {
