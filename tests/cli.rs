@@ -866,3 +866,308 @@ fn backcompat_zstd_container_still_works_after_codec_aware_build() {
     bin().arg("-d").arg(&packed).arg("-f").assert().success();
     assert_eq!(fs::read(sb.expected("old.bin")).unwrap(), body);
 }
+
+// ===========================================================================
+// Regression: read-only ops (-l/-t/-d) must work WITHOUT --create-sfx.
+//
+// During the SFX refactors a clap-derive structural change briefly made
+// --create-sfx a required argument, which silently broke `upxz -d`, `-l`,
+// and `-t` standalone (mneme issue #14). That was a stale-binary false alarm
+// — the dispatch has always treated these as independent actions — but the
+// regression is cheap to guard against forever: each read op must succeed on
+// a plain container with no -c present.
+// ===========================================================================
+
+#[test]
+fn read_ops_do_not_require_create_sfx() {
+    let sb = Sandbox::new("no-c");
+    let input = sb.write("in.bin", b"payload bytes here".repeat(20).as_slice());
+    bin().arg(&input).assert().success();
+    let packed = sb.expected("in.bin.upxz");
+
+    // -l and -t are read-only and must succeed with NO -c anywhere.
+    bin().arg("-l").arg(&packed).assert().success();
+    bin().arg("-t").arg(&packed).assert().success();
+    // -d restores; -f because the original still sits next to the container.
+    bin().arg("-d").arg(&packed).arg("-f").assert().success();
+}
+
+// ===========================================================================
+// CLI argument validation: mutually-required / required-when-set flags and
+// usage errors. These exercise clap's structural invariants, not compression.
+// ===========================================================================
+
+/// `-c` without `-o` has nowhere to write the SFX → upxz errors (exit != 0)
+/// before any platform dispatch.
+#[test]
+fn create_sfx_without_out_errors() {
+    let sb = Sandbox::new("c-no-o");
+    let input = sb.write("in.bin", b"data".repeat(32).as_slice());
+    bin().arg("-c").arg(&input).assert().failure();
+}
+
+/// `-o` is declared `requires = "create_sfx"`, so `-o` without `-c` is a clap
+/// usage error (non-zero exit), not a pack.
+#[test]
+fn out_without_create_sfx_is_rejected() {
+    let sb = Sandbox::new("o-no-c");
+    let input = sb.write("in.bin", b"data".repeat(32).as_slice());
+    bin()
+        .arg("-o")
+        .arg(sb.expected("out"))
+        .arg(&input)
+        .assert()
+        .failure();
+}
+
+/// No arguments at all → clap prints usage and exits non-zero.
+#[test]
+fn no_args_prints_usage() {
+    bin().assert().failure();
+}
+
+/// A non-existent input file must error, not silently succeed.
+#[test]
+fn missing_input_file_errors() {
+    let sb = Sandbox::new("missing");
+    bin()
+        .arg("-l")
+        .arg(sb.expected("does-not-exist.upxz"))
+        .assert()
+        .failure();
+}
+
+/// `-z 0` is below the 1..=19 range → clap value_parser rejects it.
+#[test]
+fn z_level_zero_is_rejected() {
+    let sb = Sandbox::new("z0");
+    let input = sb.write("in.bin", b"data".repeat(32).as_slice());
+    bin().arg("-z").arg("0").arg(&input).assert().failure();
+}
+
+/// `-z 20` is above the 1..=19 range (20..=22 need --ultra; -22 is a trap) →
+/// rejected. Guards the "never -22" ceiling.
+#[test]
+fn z_level_above_nineteen_is_rejected() {
+    let sb = Sandbox::new("z20");
+    let input = sb.write("in.bin", b"data".repeat(32).as_slice());
+    bin().arg("-z").arg("20").arg(&input).assert().failure();
+}
+
+/// An empty input file must still pack to a valid container and round-trip to
+/// zero bytes. (zstd happily encodes an empty frame.)
+#[test]
+fn pack_empty_file_roundtrips() {
+    let sb = Sandbox::new("empty");
+    let input = sb.write("empty.bin", b"");
+    bin().arg(&input).assert().success();
+    let packed = sb.expected("empty.bin.upxz");
+    assert_has_magic(&packed);
+
+    bin().arg("-d").arg(&packed).arg("-f").assert().success();
+    assert_eq!(fs::read(sb.expected("empty.bin")).unwrap(), b"");
+}
+
+/// Corrupting a byte inside the compressed payload must make `-t` fail: the
+/// zstd content checksum (written by the default Encoder) no longer matches
+/// the restored bytes, so decode errors. The body is high-entropy so the
+/// payload is large enough that a corruption near its tail lands on real
+/// compressed bytes, not past the end of the file.
+#[test]
+fn test_rejects_corrupted_payload() {
+    let sb = Sandbox::new("corrupt");
+    // Pseudo-random, low-compressibility body ⇒ payload stays large.
+    let body: Vec<u8> = (0..3000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+        .collect();
+    let input = sb.write("data.bin", &body);
+    bin().arg(&input).assert().success();
+    let packed = sb.expected("data.bin.upxz");
+
+    let mut bytes = fs::read(&packed).unwrap();
+    // Corrupt one byte 32 from the end: definitely inside the payload (which
+    // is the whole tail of a container — there is no trailer) and far enough
+    // from the 4-byte trailing checksum to mutate compressed data, so the
+    // recomputed checksum will not match the stored one.
+    let pos = bytes.len() - 32;
+    bytes[pos] ^= 0xff;
+    fs::write(&packed, &bytes).unwrap();
+
+    bin().arg("-t").arg(&packed).assert().failure();
+}
+
+// ===========================================================================
+// SFX runtime contracts (unix: linux stub + macos loader share these). The
+// self-extractor must behave like the original binary for fd inheritance and
+// must fail cleanly — not crash or exec garbage — on a tampered packed file.
+// ===========================================================================
+
+/// `./packed` must inherit the parent's stdin and pipe it to the inner program
+/// (the loader's execv inherits fds by default). A `cat`-style inner echoes
+/// stdin back to stdout verbatim.
+#[test]
+fn sfx_inherits_stdin_to_inner() {
+    let sb = Sandbox::new("sfx-stdin");
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let script = b"#!/bin/sh\ncat\n";
+        let input = sb.write("cat.sh", script);
+        let packed = sb.expected("cat.packed");
+        bin()
+            .arg("-c")
+            .arg(&input)
+            .arg("-o")
+            .arg(&packed)
+            .assert()
+            .success();
+
+        let mut child = std::process::Command::new(&packed)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn SFX");
+        {
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            stdin
+                .write_all(b"hello-through-stdin\n")
+                .expect("write stdin");
+        }
+        let out = child.wait_with_output().expect("wait SFX");
+        assert!(out.status.success(), "SFX stdin test exited {:#?}", out);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "hello-through-stdin",
+            "stdin was not forwarded to the inner program"
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sb;
+    }
+}
+
+/// The inner program's stdout and stderr must stay on their correct streams
+/// through the SFX exec — stdout must NOT contain the stderr text.
+#[test]
+fn sfx_separates_stdout_and_stderr() {
+    let sb = Sandbox::new("sfx-streams");
+    #[cfg(unix)]
+    {
+        use std::process::Stdio;
+
+        let script = b"#!/bin/sh\necho OUT-LINE; echo ERR-LINE 1>&2\n";
+        let input = sb.write("io.sh", script);
+        let packed = sb.expected("io.packed");
+        bin()
+            .arg("-c")
+            .arg(&input)
+            .arg("-o")
+            .arg(&packed)
+            .assert()
+            .success();
+
+        let out = std::process::Command::new(&packed)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run SFX");
+        assert!(out.status.success(), "SFX exited {:#?}", out);
+        let so = String::from_utf8_lossy(&out.stdout);
+        let se = String::from_utf8_lossy(&out.stderr);
+        assert!(so.contains("OUT-LINE"), "stdout missing OUT-LINE: {so}");
+        assert!(se.contains("ERR-LINE"), "stderr missing ERR-LINE: {se}");
+        assert!(
+            !so.contains("ERR-LINE"),
+            "stderr text leaked into stdout: {so}"
+        );
+        assert!(
+            !se.contains("OUT-LINE"),
+            "stdout text leaked into stderr: {se}"
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sb;
+    }
+}
+
+/// A packed file whose trailer has been truncated is malformed. Running it
+/// must fail cleanly with a non-zero exit (loader/stub detects the bad trailer
+/// / lengths and aborts) — never exec arbitrary bytes or crash the harness.
+#[test]
+fn sfx_rejects_truncated_packed_file() {
+    let sb = Sandbox::new("sfx-trunc");
+    #[cfg(unix)]
+    {
+        use std::process::Stdio;
+
+        let script = b"#!/bin/sh\necho should-not-run\n";
+        let input = sb.write("v.sh", script);
+        let packed = sb.expected("v.packed");
+        bin()
+            .arg("-c")
+            .arg(&input)
+            .arg("-o")
+            .arg(&packed)
+            .assert()
+            .success();
+
+        // Drop the last 16 bytes: on macOS that removes the whole
+        // UPXZEND1+loader_len+app_len trailer; on linux it removes the 8-byte
+        // stub_size trailer plus payload tail. Either way the self-extractor
+        // can no longer locate its segments.
+        let mut bytes = fs::read(&packed).unwrap();
+        let cut = bytes.len().saturating_sub(16);
+        bytes.truncate(cut);
+        fs::write(&packed, &bytes).unwrap();
+
+        let status = std::process::Command::new(&packed)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .status()
+            .expect("run truncated SFX");
+        assert!(
+            !status.success(),
+            "truncated SFX must not exit 0 (status={:?})",
+            status
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sb;
+    }
+}
+
+// ===========================================================================
+// macOS-only: the no_std loader is zstd-only for size, so a gzip SFX must be
+// refused up front with a clear message rather than emit a packed file the
+// loader cannot run. (Linux stub + the cross-platform runner both support gzip.)
+// ===========================================================================
+
+#[test]
+fn gzip_sfx_rejected_on_macos() {
+    let sb = Sandbox::new("gz-sfx-mac");
+    #[cfg(target_os = "macos")]
+    {
+        let input = sb.write("in.sh", b"#!/bin/sh\necho x\n");
+        bin()
+            .arg("--gz")
+            .arg("-c")
+            .arg(&input)
+            .arg("-o")
+            .arg(sb.expected("gz.packed"))
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "gzip SFX is not supported on macOS",
+            ));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = sb;
+    }
+}

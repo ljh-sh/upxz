@@ -6,3 +6,6 @@
 *~
 .DS_Store
 **/.release-artifacts/
+
+# local agent worktrees (see mneme worktree-per-task rule)
+.worktrees/
