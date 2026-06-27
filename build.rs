@@ -77,8 +77,7 @@ fn build_linux_stub(out_dir: &Path) {
     // the child's output to a unique dir under OUT_DIR sidesteps the lock
     // entirely — the same workaround `build_windows_stub` uses below.
     let stub_target_dir = out_dir.join("stub-target");
-    std::fs::create_dir_all(&stub_target_dir)
-        .expect("create isolated target dir for stub build");
+    std::fs::create_dir_all(&stub_target_dir).expect("create isolated target dir for stub build");
 
     let status = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()))
         .args(["build", "--release", "-p", "upxz-stub", "--target", &target])
@@ -101,7 +100,8 @@ fn build_linux_stub(out_dir: &Path) {
     if !artifact.is_file() {
         // Fall back to the workspace default target dir in case the caller
         // overrode the target-dir to point elsewhere.
-        let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+        let manifest_dir =
+            PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
         let alt = manifest_dir
             .join("target")
             .join(&target)
