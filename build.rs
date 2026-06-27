@@ -60,26 +60,51 @@ fn build_linux_stub(out_dir: &Path) {
     // release because the stub runs on every SFX invocation: size + speed
     // matter, and a stripped optimized stub is much smaller than a debug one.
     let target = env::var("HOST").expect("HOST set by Cargo");
+
+    // Use a SEPARATE target dir for the recursive stub build. A build script
+    // that recursively invokes `cargo build` against the SAME workspace
+    // deadlocks on the target-dir lock when parent and child share a profile:
+    // the parent `cargo build --release` holds the workspace `target/` lock for
+    // its whole run; the child `cargo build --release -p upxz-stub` (same
+    // `target/`) blocks waiting for it, so build.rs never returns. This hung
+    // the `cargo build --release` step on Linux CI until the 6h job cap —
+    // verified: the cancelled run left three orphans (parent cargo,
+    // build-script-build, child cargo). `cargo test` survived only because its
+    // dev profile did not contend on the release target artifacts.
+    //
+    // macOS (`loader/target`) and Windows (`winstub-target`) already isolate
+    // their recursive builds for this exact reason; Linux must too. Redirecting
+    // the child's output to a unique dir under OUT_DIR sidesteps the lock
+    // entirely — the same workaround `build_windows_stub` uses below.
+    let stub_target_dir = out_dir.join("stub-target");
+    std::fs::create_dir_all(&stub_target_dir)
+        .expect("create isolated target dir for stub build");
+
     let status = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()))
         .args(["build", "--release", "-p", "upxz-stub", "--target", &target])
+        // Isolate the recursive build's target dir so it does NOT share the
+        // parent workspace's target lock (avoids the build-script recursion
+        // deadlock). The artifact lands under this dir.
+        .env("CARGO_TARGET_DIR", &stub_target_dir)
         .status()
         .expect("failed to invoke `cargo build -p upxz-stub`");
     if !status.success() {
         panic!("building upxz-stub failed (exit {:?})", status.code());
     }
 
-    // Locate the produced binary. With an explicit `--target`, the artifact is
-    // under `target/<triple>/release/`. Without one it is under `target/release/`.
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let artifact = manifest_dir
-        .join("target")
+    // With an explicit `--target` AND a custom CARGO_TARGET_DIR, the artifact
+    // is under `<stub_target_dir>/<triple>/release/upxz-stub`.
+    let artifact = stub_target_dir
         .join(&target)
         .join("release")
         .join(stub_binary_name());
     if !artifact.is_file() {
-        // Fall back to the no-target path in case the caller overrode target-dir.
+        // Fall back to the workspace default target dir in case the caller
+        // overrode the target-dir to point elsewhere.
+        let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
         let alt = manifest_dir
             .join("target")
+            .join(&target)
             .join("release")
             .join(stub_binary_name());
         if !alt.is_file() {
