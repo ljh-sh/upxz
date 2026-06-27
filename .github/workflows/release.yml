@@ -65,6 +65,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@4d1965c9142484e48d40c19de54b5cba84953a06 # v1.10.0
 
       - name: Build (release, reproducible)
+        shell: bash   # bash syntax on all runners (windows-latest defaults to pwsh)
         run: |
           SYSROOT="$(rustc --print sysroot)"
           export RUSTFLAGS="--remap-path-prefix=${{ github.workspace }}=. --remap-path-prefix=$SYSROOT=/rust --remap-path-prefix=$HOME/.cargo=/cargo"
