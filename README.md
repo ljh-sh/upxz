@@ -7,6 +7,22 @@
 
 > 极简单二进制文件打包器：一个文件进、一个文件出，校验文件头 magic，用 zstd 打包。 — [中文文档](README.cn.md)
 
+## TL;DR
+
+```bash
+upxz notes.txt               # pack   → notes.txt.upxz (zstd, default level 19)
+upxz notes.txt.upxz          # run    → decompress + exec the original
+upxz -d notes.txt.upxz       # unpack → restore the original bytes
+upxz -l notes.txt.upxz       # list   → codec / sizes / original name
+upxz -t notes.txt.upxz       # test   → verify magic + round-trip
+upxz -c myapp -o myapp.sfx   # build a self-extracting binary (./myapp.sfx runs)
+upxz --fast big.bin          # pack at zstd level 1 (lowest CPU)
+upxz --gz notes.txt          # pack with gzip instead of zstd
+```
+
+A plain `FILE` is **packed**; a `.upxz` container is **run**. The mode is
+auto-detected from the magic — you never tell `upxz` which.
+
 ## What is this
 
 `upxz` wraps a single file in a small container and compresses it with
@@ -18,21 +34,37 @@ narrow:
   Re-packing an existing container is refused.
 - **Single binary.** Statically links zstd; no Python, no extra runtimes.
 
-Two subcommands:
+upx-style **flat CLI** (no subcommands) — a flag picks the action, and pack vs
+run is auto-detected from the input's magic:
 
-| command                  | effect                                                |
-| ------------------------ | ----------------------------------------------------- |
-| `upxz pack <FILE>`       | wrap `FILE` as `FILE.upxz` (magic + original name + zstd payload) |
-| `upxz unpack <FILE.upxz>` | verify magic, restore the original bytes to disk      |
+| invocation                       | action                                                        |
+| -------------------------------- | ------------------------------------------------------------- |
+| `upxz <FILE>`                    | **pack** → `<FILE>.upxz` (magic + original name + zstd payload) |
+| `upxz <FILE>.upxz`               | **run** → decompress + exec the original (propagates exit code) |
+| `upxz -d <FILE>.upxz`            | **unpack** → restore the original bytes to disk               |
+| `upxz -l <FILE>.upxz`            | **list** → codec / sizes / original name (read-only)          |
+| `upxz -t <FILE>.upxz`            | **test** → verify magic + round-trip decompress (read-only)   |
+| `upxz -c <orig> -o <packed>`     | **SFX** → a self-extracting binary                            |
+| `upxz --bin <inner> <a.tar.zst>` | **bin run** → run one entry from a `.tar.zst` without extracting |
 
 ## Install
 
-```bash
-# from source — full feature set including SFX (`-c`)
-cargo install --git https://github.com/ljh-sh/upxz
+**Prebuilt binary** (Linux x86_64, macOS arm64, Windows x86_64 — cosign-signed,
+with `SHA256SUMS`) from the [latest release](https://github.com/ljh-sh/upxz/releases/latest):
 
-# or download a prebuilt, signed binary from releases
-# https://github.com/ljh-sh/upxz/releases
+```bash
+# pick the tarball for your platform, then:
+tar xJf upxz-<target>.tar.xz -C /usr/local/bin --strip-components=1 bin/upxz
+
+# verify the checksum + signature
+sha256sum -c SHA256SUMS --ignore-missing
+cosign verify-blob --bundle upxz-<target>.tar.xz.sigstore.json upxz-<target>.tar.xz
+```
+
+**From source** (full feature set incl. SFX `-c`):
+
+```bash
+cargo install --git https://github.com/ljh-sh/upxz
 ```
 
 > **`cargo install upxz` (from crates.io) gives the runner/packer but not SFX.**
@@ -40,36 +72,48 @@ cargo install --git https://github.com/ljh-sh/upxz
 > (`stub/`/`loader/`/`winstub/`), so the self-extracting-binary feature
 > (`-c`/`--create-sfx`) cannot be compiled from a crates.io install — `upxz -c`
 > refuses with a clear message. Pack / run / `--bin` / list / test all work.
-> For SFX, use one of the two commands above (both ship the full source).
+> For SFX, use a release binary or `cargo install --git` (both ship full source).
 > Tracked in [#11](https://github.com/ljh-sh/upxz/issues/11).
 
 ## Usage
 
 ```bash
-# pack with the default compression tier (zstd level 3)
-upxz pack notes.txt              # -> notes.txt.upxz
+# pack a file (zstd, default level 19) — auto-detected because notes.txt is a plain file
+upxz notes.txt                   # -> notes.txt.upxz
 
-# trade CPU for a smaller file
-upxz pack notes.txt --best -o notes.txt.upxz
+# run a container — auto-detected because the magic says it's packed
+upxz notes.txt.upxz              # decompresses + execs the original; propagates exit code
+upxz notes.txt.upxz -- --flag value   # args after -- forwarded verbatim to the inner program
 
-# lowest CPU, useful in hot loops
-upxz pack notes.txt --fast
+# inspect / verify / restore (read-mostly)
+upxz -l notes.txt.upxz           # list: codec / sizes / original name
+upxz -t notes.txt.upxz           # test: magic + round-trip decompress
+upxz -d notes.txt.upxz           # unpack: restore the original bytes (-> notes.txt)
+upxz -d notes.txt.upxz -f        # overwrite an existing notes.txt
 
-# restore the original bytes
-upxz unpack notes.txt.upxz       # -> notes.txt (name from the container header)
+# pick a compression level
+upxz --fast notes.txt            # zstd level 1 — lowest CPU, hot loops
+upxz -z 9 notes.txt              # zstd level 9  (any 1..=19)
+upxz --gz notes.txt              # gzip instead of zstd (codec id 1 in the magic)
+
+# build a self-extracting binary
+upxz -c myapp -o myapp.sfx && ./myapp.sfx --flag value
 ```
 
-### Compression tiers
+### Compression
 
-upxz exposes zstd as three named presets rather than a raw `--level=N` knob:
+A 2-tier preset plus an explicit level — no `--best`, never `-22` (a documented
+zstd trap: same size as `-19`, ~2× slower). `-z N` wins over `--fast`:
 
-| tier      | flag     | zstd level | when to use                    |
-| --------- | -------- | ---------- | ------------------------------ |
-| default   | _(none)_ | 3          | the common case                |
-| fast      | `--fast` | 1          | minimize CPU                   |
-| best      | `--best` | 19         | smallest output, highest CPU   |
+| selection | flag      | zstd level | when                     |
+| --------- | --------- | ---------- | ------------------------ |
+| default   | _(none)_  | 19         | the common case (smallest) |
+| fast      | `--fast`  | 1          | minimize CPU             |
+| explicit  | `-z N`    | N (1..=19) | pin a specific level     |
 
-`--fast` and `--best` are mutually exclusive.
+`--gz` switches the codec to gzip (DEFLATE 1..=9, default 9); `-z N` then sets
+the DEFLATE level. See [Codec: zstd or gzip](#codec-zstd-default-or-gzip-gz)
+below.
 
 ### Codec: zstd (default) or gzip (`--gz`)
 
