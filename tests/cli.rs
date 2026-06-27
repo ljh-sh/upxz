@@ -1120,12 +1120,24 @@ fn sfx_rejects_truncated_packed_file() {
         // UPXZEND1+loader_len+app_len trailer; on linux it removes the 8-byte
         // stub_size trailer plus payload tail. Either way the self-extractor
         // can no longer locate its segments.
+        //
+        // Write the truncated bytes to a FRESH path (not overwriting `packed`
+        // in place): on Linux, execve'ing a file immediately after writing it
+        // in place can race with ETXTBSY ("Text file busy", errno 26) — the
+        // kernel briefly still sees the file as open-for-writing. A fresh file
+        // that no prior process touched avoids the race (this test was flaky
+        // on ubuntu CI when it overwrote `packed` in place).
         let mut bytes = fs::read(&packed).unwrap();
         let cut = bytes.len().saturating_sub(16);
         bytes.truncate(cut);
-        fs::write(&packed, &bytes).unwrap();
+        let truncated = sb.expected("v-trunc.packed");
+        fs::write(&truncated, &bytes).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&truncated, fs::Permissions::from_mode(0o755)).unwrap();
+        }
 
-        let status = std::process::Command::new(&packed)
+        let status = std::process::Command::new(&truncated)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .status()
