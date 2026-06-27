@@ -1120,13 +1120,6 @@ fn sfx_rejects_truncated_packed_file() {
         // UPXZEND1+loader_len+app_len trailer; on linux it removes the 8-byte
         // stub_size trailer plus payload tail. Either way the self-extractor
         // can no longer locate its segments.
-        //
-        // Write the truncated bytes to a FRESH path (not overwriting `packed`
-        // in place): on Linux, execve'ing a file immediately after writing it
-        // in place can race with ETXTBSY ("Text file busy", errno 26) — the
-        // kernel briefly still sees the file as open-for-writing. A fresh file
-        // that no prior process touched avoids the race (this test was flaky
-        // on ubuntu CI when it overwrote `packed` in place).
         let mut bytes = fs::read(&packed).unwrap();
         let cut = bytes.len().saturating_sub(16);
         bytes.truncate(cut);
@@ -1137,11 +1130,33 @@ fn sfx_rejects_truncated_packed_file() {
             fs::set_permissions(&truncated, fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        let status = std::process::Command::new(&truncated)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .status()
-            .expect("run truncated SFX");
+        // Run the tampered SFX. On Linux this can transiently fail with
+        // ETXTBSY ("Text file busy", errno 26): execve refuses a file the
+        // kernel still sees as open-for-writing right after we wrote it. The
+        // window is short (writeback / close propagation on the runner's fs),
+        // so we RETRY — the exec eventually succeeds and the truncated SFX
+        // then fails cleanly (bad trailer). A fresh-file path alone did NOT
+        // eliminate this on ubuntu x86_64 (flaked twice on CI); the retry is
+        // the real fix. macOS does not exhibit ETXTBSY here.
+        let mut status = None;
+        for _ in 0..30 {
+            match std::process::Command::new(&truncated)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .status()
+            {
+                Ok(s) => {
+                    status = Some(s);
+                    break;
+                }
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    continue;
+                }
+                Err(e) => panic!("run truncated SFX failed (non-ETXTBSY): {e}"),
+            }
+        }
+        let status = status.expect("run truncated SFX: still ETXTBSY after 30 retries");
         assert!(
             !status.success(),
             "truncated SFX must not exit 0 (status={:?})",

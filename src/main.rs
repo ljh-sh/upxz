@@ -34,7 +34,22 @@ use crate::level::LevelArgs;
 #[command(
     name = "upxz",
     version,
-    about = "upx using zstd — runner + packer. Auto-detects pack vs run by magic."
+    about = "upx using zstd — runner + packer. Auto-detects pack vs run by magic.",
+    after_help = "EXAMPLES:
+  upxz notes.txt                       pack   → notes.txt.upxz (zstd, default level 19)
+  upxz notes.txt.upxz                  run    → decompress + exec the original
+  upxz -d notes.txt.upxz               unpack → restore the original bytes
+  upxz -l notes.txt.upxz               list   → codec, sizes, original name
+  upxz -t notes.txt.upxz               test   → verify magic + round-trip decompress
+  upxz --fast notes.txt                pack at zstd level 1 (lowest CPU, hot loops)
+  upxz -z 9 notes.txt                  pack at zstd level 9 (range 1..=19)
+  upxz --gz notes.txt                  pack with gzip instead of zstd
+  upxz -c myapp -o myapp.sfx           build a self-extracting binary (./myapp.sfx runs)
+  upxz --bin bin/myapp app.tar.zst -- --flag value   run one entry from a .tar.zst
+
+A plain FILE is packed; a .upxz container is run. The mode is auto-detected
+from the magic — you never tell upxz which. Compression: default zstd 19;
+--fast zstd 1; -z N zstd N (1..=19); --gz gzip (1..=9, default 9)."
 )]
 struct Cli {
     /// Input file. A plain file → packed to <FILE>.upxz; a .upxz container → run.
