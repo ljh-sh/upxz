@@ -1,3 +1,31 @@
+# Unreleased
+
+- **Cross-arch release binaries**: the release matrix now ships **aarch64 Linux
+  and x86_64 macOS** in addition to x86_64 Linux, aarch64 macOS, and x86_64
+  Windows. `aarch64-unknown-linux-gnu` builds on a native ARM runner;
+  `x86_64-apple-darwin` is cross-compiled on the arm64 macOS runner (no Intel
+  mac runner remains).
+- **`build.rs` honors `--target` for the SFX companion crates**: `build_linux_stub`
+  switched `HOST` → `TARGET`, and `build_macos_pieces` now builds the loader with
+  `--target`. Previously the stub/loader built for the host arch even when upxz
+  was cross-compiled, so an x86_64-apple-darwin upxz embedded an **arm64**
+  loader — the packed file's Mach-O header was the wrong arch. Native builds are
+  unchanged (TARGET == HOST there). `build_windows_stub` already used `TARGET`.
+- **macOS loader `fstat` → `lseek` (x86_64 SFX runtime fix)**: the no_std loader
+  sized the packed file with `fstat` + a hand-rolled `struct stat`. On x86_64
+  macOS the raw `fstat` symbol a Rust `extern` links is the **legacy 32-bit-inode
+  variant** (`fstat`, not `fstat$INODE64` the C headers alias to); it writes a
+  different, smaller struct, so `st_size` read as 0 and every x86_64 SFX failed
+  at runtime with "packed file too small to contain a trailer". arm64 has no
+  legacy symbol, which is why this was latent until cross-arch built a real
+  x86_64 loader. Fixed by sizing via `lseek(fd, 0, SEEK_END)` — no struct-stat
+  ABI dependency. Verified end-to-end (x86_64 SFX runs under Rosetta 2; arm64
+  native unaffected; 45 tests green).
+- **Release CI**: every build now passes `--target` explicitly and copies the
+  artifact from `target/<triple>/release/`; a per-target **SFX smoke test**
+  (pack `/bin/echo`, run it, assert output) guards the loader path — a green
+  `cargo build` did not catch the fstat regression.
+
 # v0.3.0 — three-platform SFX + codec-agnostic + `--bin` archive run
 
 The first release with **self-extracting binaries on all three platforms**, a **codec-agnostic container** (zstd default, gzip via `--gz`), and **AppImage-style archive run** (`--bin`). Plus CI stability and a working crates.io publish path. **45 tests pass.**
