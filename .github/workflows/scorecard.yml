@@ -1,0 +1,52 @@
+name: OpenSSF Scorecard
+
+# Runs the OpenSSF Scorecard analysis and publishes results to the repo's
+# Security tab (SARIF) and to scorecard.dev. This backs the Scorecard badge in
+# the README. Pattern mirrors the other ljh-sh Rust CLIs (roff / chardet).
+#
+# Triggers: branch-protection changes, a weekly schedule, pushes to main, and
+# manual dispatch. `publish_results: true` requires id-token: write (OIDC).
+
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: '17 3 * * 1'   # weekly, off the top of the hour
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write   # upload SARIF to the Security tab
+      id-token: write           # publish_results via OIDC
+    steps:
+      - name: Checkout
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+        with:
+          persist-credentials: false   # Scorecard recommends this
+
+      - name: Run Scorecard
+        uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a # v2.4.3
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: scorecard-sarif
+          path: results.sarif
+          retention-days: 5
+
+      - name: Upload to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@f6091c0113d1dcf9b98e269ee48e8a7e51b7bdd4 # v3.28.5
+        with:
+          sarif_file: results.sarif
