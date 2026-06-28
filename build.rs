@@ -100,10 +100,18 @@ fn build_linux_stub(out_dir: &Path) {
     let stub_path = out_dir.join("upxz-stub.bin");
     let loader_path = out_dir.join("upxz-loader.bin");
 
-    // Build the stub as a release artifact targeting the host triple. We pin
-    // release because the stub runs on every SFX invocation: size + speed
-    // matter, and a stripped optimized stub is much smaller than a debug one.
-    let target = env::var("HOST").expect("HOST set by Cargo");
+    // Build the stub as a release artifact targeting the TARGET triple (NOT
+    // HOST). We pin release because the stub runs on every SFX invocation:
+    // size + speed matter, and a stripped optimized stub is much smaller than a
+    // debug one.
+    //
+    // TARGET, not HOST: this branch is reached whenever `CARGO_CFG_TARGET_OS ==
+    // "linux"`, which is also true when upxz is *cross-compiled* to Linux from a
+    // non-Linux host (or a different Linux arch, e.g. aarch64-unknown-linux-gnu
+    // from x86_64). HOST would then be the build host's triple and the embedded
+    // stub would be for the wrong arch. `TARGET` is always the triple being
+    // built for (== HOST only on a native build), matching `build_windows_stub`.
+    let target = env::var("TARGET").expect("TARGET set by Cargo");
 
     // Use a SEPARATE target dir for the recursive stub build. A build script
     // that recursively invokes `cargo build` against the SAME workspace
@@ -182,14 +190,22 @@ fn build_macos_pieces(out_dir: &Path) {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let loader_dir = manifest_dir.join("loader");
 
-    // Build the loader crate as a STANDALONE release artifact. We deliberately
-    // do NOT use `-p upxz-loader` from the workspace root: the loader is not a
-    // workspace member (it needs its own `[profile.release]` with
-    // `panic = "abort"`, which workspace membership would override and break
-    // the no_std build). Invoking cargo from inside `loader/` makes that
-    // manifest authoritative.
+    // Build the loader crate as a STANDALONE release artifact for the TARGET
+    // triple. We deliberately do NOT use `-p upxz-loader` from the workspace
+    // root: the loader is not a workspace member (it needs its own
+    // `[profile.release]` with `panic = "abort"`, which workspace membership
+    // would override and break the no_std build). Invoking cargo from inside
+    // `loader/` makes that manifest authoritative.
+    //
+    // `--target` is required for cross-arch: macOS runners are now arm64
+    // (aarch64-apple-darwin), so building an x86_64-apple-darwin upxz must
+    // cross-compile the loader too, or the embedded loader would be arm64 while
+    // the packed file's Mach-O header (== the loader) must be x86_64. Without
+    // `--target`, the standalone build used the host arch. `TARGET` is the env
+    // var Cargo always sets to the triple being built for (== HOST natively).
+    let target = env::var("TARGET").expect("TARGET set by Cargo");
     let status = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()))
-        .args(["build", "--release"])
+        .args(["build", "--release", "--target", &target])
         .current_dir(&loader_dir)
         .status()
         .expect("failed to invoke `cargo build --release` in loader/");
@@ -197,9 +213,11 @@ fn build_macos_pieces(out_dir: &Path) {
         panic!("building upxz-loader failed (exit {:?})", status.code());
     }
 
-    // The artifact lands in `loader/target/release/upxz-loader`.
+    // The artifact lands in `loader/target/<triple>/release/upxz-loader` (the
+    // `<triple>` subdir appears once `--target` is passed).
     let artifact = loader_dir
         .join("target")
+        .join(&target)
         .join("release")
         .join(loader_binary_name());
     if !artifact.is_file() {

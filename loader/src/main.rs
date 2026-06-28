@@ -85,7 +85,6 @@ extern "C" {
     fn close(fd: c_int) -> c_int;
     fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
     fn lseek(fd: c_int, offset: i64, whence: c_int) -> i64;
-    fn fstat(fd: c_int, buf: *mut Stat) -> c_int;
     fn chmod(path: *const c_char, mode: u32) -> c_int;
     fn execv(path: *const c_char, argv: *const *const c_char) -> c_int;
     fn fork() -> c_int;
@@ -109,39 +108,12 @@ extern "C" {
     fn realpath(path: *const c_char, resolved: *mut c_char) -> *mut c_char;
 }
 
-// macOS `struct stat` layout (arm64 + x86_64 share this 144-byte form).
-#[repr(C)]
-#[derive(Default)]
-struct Stat {
-    st_dev: u32,
-    st_mode: u16,
-    st_nlink: u16,
-    st_ino: u64,
-    st_uid: u32,
-    st_gid: u32,
-    st_rdev: u32,
-    st_atime: i64,
-    st_atimensec: i64,
-    st_mtime: i64,
-    st_mtimensec: i64,
-    st_ctime: i64,
-    st_ctimensec: i64,
-    st_birthtime: i64,
-    st_birthtimensec: i64,
-    st_size: i64,
-    st_blocks: i64,
-    st_blksize: i32,
-    st_flags: u32,
-    st_gen: u32,
-    st_lspare: i32,
-    st_qspare: [i64; 2],
-}
-
 const O_RDONLY: c_int = 0;
 const O_WRONLY: c_int = 1;
 const O_CREAT: c_int = 0o100;
 const O_TRUNC: c_int = 0o1000;
 const SEEK_SET: c_int = 0;
+const SEEK_END: c_int = 2;
 
 // Trailer (16 bytes): magic(8) + loader_len(4 BE) + app_len(4 BE).
 // Two-segment design: there is no boot segment, so the trailer records only
@@ -269,19 +241,30 @@ unsafe fn real_main(argc: c_int, argv: *const *const c_char) -> c_int {
         *argv.offset(0)
     };
 
-    // --- 1. Open the packed file (== ourselves) and size it. ---
+    // --- 1. Open the packed file (== ourselves) and size it via lseek. ---
     let fd = open(packed_path, O_RDONLY);
     if fd < 0 {
         warn(2, b"upxz-loader: cannot open packed file\n");
         return EXIT_IO;
     }
-    let mut st: Stat = core::mem::zeroed();
-    if fstat(fd, &mut st) != 0 {
-        warn(2, b"upxz-loader: cannot stat packed file\n");
+    // Size the file with `lseek(.., 0, SEEK_END)`, NOT `fstat` + `st_size`.
+    // The raw `fstat` symbol a Rust `extern` resolves to on x86_64 macOS is the
+    // LEGACY 32-bit-inode variant (`fstat`, not `fstat$INODE64` the C headers
+    // alias to); it writes a DIFFERENT, smaller `struct stat`, so `st_size`
+    // lands at the wrong offset and reads 0 — the packed file then looks "too
+    // small" and every x86_64 SFX fails at runtime. arm64 has no legacy symbol
+    // (its `fstat` is already inode64), which is why this only breaks for
+    // x86_64-apple-darwin. A hand-rolled `struct stat` is the fragile part, so
+    // we drop it entirely: `lseek` to EOF gives the byte size portably with no
+    // struct-ABI dependency. The trailer/app reads below seek absolute offsets,
+    // so we never need to restore the cursor after this.
+    let end = lseek(fd, 0, SEEK_END);
+    if end < 0 {
+        warn(2, b"upxz-loader: cannot seek packed file\n");
         close(fd);
         return EXIT_IO;
     }
-    let total = st.st_size as usize;
+    let total = end as usize;
     if total < TRAILER_LEN {
         warn(
             2,

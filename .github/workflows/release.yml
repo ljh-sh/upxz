@@ -8,10 +8,15 @@ name: Release
 # pinned action SHAs, least-privilege per-job permissions, cosign sign-blob
 # via OIDC (id-token: write), and SHA256SUMS. OpenSSF-aligned.
 #
-# Native-only matrix: upxz's build.rs compiles the SFX companion crate
-# (stub/loader/winstub) for the HOST, so each target is built on its native
-# runner. Cross-arch targets (e.g. aarch64-linux, x86_64-apple-darwin) need
-# build.rs to honor --target for the companions first — see issue #11 / TODO.
+# Matrix: x86_64 + aarch64 for Linux and macOS, plus x86_64 Windows.
+#   - aarch64-unknown-linux-gnu builds on a native ARM runner (GA for public
+#     repos) so HOST == TARGET.
+#   - x86_64-apple-darwin is CROSS-compiled on the arm64 macos runner (no Intel
+#     mac runner remains) via an explicit `--target`; this needs build.rs to
+#     build the SFX companion crates for TARGET (not HOST) so the embedded
+#     loader is x86_64 too. Every build passes `--target` explicitly and copies
+#     the artifact from target/<triple>/release/, which keeps the paths uniform
+#     for native and cross builds alike.
 #
 # Triggers:
 #   - push tag v*            -> build + attach to that release
@@ -47,11 +52,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Native builds only — see comment header about build.rs companions.
+          # Linux: x86_64 native; aarch64 on a native ARM runner.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          # macOS: aarch64 native; x86_64 cross-compiled (needs the target
+          # installed — cross_target — and the build.rs --target fix).
           - target: aarch64-apple-darwin
             os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross_target: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
 
@@ -64,18 +76,51 @@ jobs:
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@4d1965c9142484e48d40c19de54b5cba84953a06 # v1.10.0
 
+      - name: Add cross-compile target
+        # Only the x86_64-apple-darwin build is cross-compiled (on an arm64
+        # macos runner); native builds already have their target installed.
+        if: matrix.cross_target
+        run: rustup target add ${{ matrix.target }}
+
       - name: Build (release, reproducible)
         shell: bash   # bash syntax on all runners (windows-latest defaults to pwsh)
         run: |
           SYSROOT="$(rustc --print sysroot)"
           export RUSTFLAGS="--remap-path-prefix=${{ github.workspace }}=. --remap-path-prefix=$SYSROOT=/rust --remap-path-prefix=$HOME/.cargo=/cargo"
-          cargo build --release --locked
+          # Always pass --target: native builds land in target/<host>/release
+          # (== target/release in effect) and cross builds land in
+          # target/<triple>/release. build.rs reads TARGET (set by --target) to
+          # build the SFX companion crates for the right arch.
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: SFX smoke test (Unix)
+        # Pack /bin/echo into a self-extractor and run it, asserting it prints
+        # the forwarded arg. This guards the SFX loader end-to-end: a clean
+        # `cargo build` does NOT catch a loader runtime bug (the macOS
+        # fstat/$INODE64 issue broke every x86_64 SFX while the build was green).
+        # On the arm64 macos runner the x86_64-apple-darwin SFX runs under
+        # Rosetta 2 (preinstalled); aarch64/x86_64-linux run natively. Windows
+        # has no /bin/echo and is covered by the winstub unit tests instead.
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/upxz"
+          # The x86_64-apple-darwin SFX is run on an arm64 macos runner; ensure
+          # Rosetta 2 can translate it (preinstalled on GitHub runners, but
+          # install on demand so the smoke test never fails on the environment).
+          if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ]; then
+            arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+          "$BIN" -c /bin/echo -o /tmp/smoke.sfx -f
+          out=$(/tmp/smoke.sfx hello-from-sfx 2>/dev/null)
+          [ "$out" = "hello-from-sfx" ] || { echo "SFX smoke FAILED: got '$out'"; exit 1; }
+          echo "SFX smoke OK"
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist/bin
-          cp target/release/upxz dist/bin/
+          cp target/${{ matrix.target }}/release/upxz dist/bin/
           strip dist/bin/upxz 2>/dev/null || true
           # Normalize mtimes for a reproducible tarball.
           find dist -exec touch -m -t 202311140000.00 {} +
@@ -86,7 +131,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist/bin | Out-Null
-          Copy-Item target/release/upxz.exe dist/bin/upxz.exe
+          Copy-Item target/${{ matrix.target }}/release/upxz.exe dist/bin/upxz.exe
           tar -cJf "dist/upxz-${{ matrix.target }}.tar.xz" -C dist bin
 
       - name: Upload artifact

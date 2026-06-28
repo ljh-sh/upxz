@@ -44,7 +44,7 @@ upx 风格的**扁平 CLI**（无子命令）——用 flag 选动作，打包 v
 
 ## 安装
 
-**预编译二进制**（Linux x86_64、macOS arm64、Windows x86_64 —— cosign 签名，附 `SHA256SUMS`），见 [最新 release](https://github.com/ljh-sh/upxz/releases/latest)：
+**预编译二进制**（Linux x86_64/arm64、macOS x86_64/arm64、Windows x86_64 —— cosign 签名，附 `SHA256SUMS`），见 [最新 release](https://github.com/ljh-sh/upxz/releases/latest)：
 
 ```bash
 # 选你平台的 tarball，然后：
