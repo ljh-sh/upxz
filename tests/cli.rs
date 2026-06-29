@@ -83,26 +83,22 @@ fn assert_is_self_extractor(path: &PathBuf) {
             mode
         );
     }
-    // The SFX embeds the UPXZ container past the platform stub/loader, so the
-    // UPXZ prefix appears at offset > 0.
-    let prefix = b"UPXZ\x01";
+    // Find the embedded container via the full 8-byte magic (prefix + valid
+    // codec id 0/1 + reserved zeros). The Linux/Windows stub binaries ALSO
+    // embed the 5-byte prefix (`MAGIC_PREFIX` const in stub/src/main.rs and
+    // winstub/src/main.rs), so a naive prefix-only search matches the stub's
+    // own `.rodata` first and reads garbage for the codec/reserved bytes.
+    // Validating the full 8-byte magic skips the stub's const and lands on the
+    // real embedded container past it.
     let off = bytes
-        .windows(prefix.len())
-        .position(|w| w == prefix)
+        .windows(8)
+        .position(|w| w[..5] == *b"UPXZ\x01" && (w[5] == 0 || w[5] == 1) && w[6] == 0 && w[7] == 0)
         .unwrap_or_else(|| panic!("no embedded UPXZ container in {}", path.display()));
     assert!(
         off > 0,
         "UPXZ prefix at offset 0 means this is a bare container, not an SFX: {}",
         path.display()
     );
-    // The embedded container must also be a valid codec id (0 = zstd, 1 = gzip).
-    assert!(
-        bytes[off + 5] == 0 || bytes[off + 5] == 1,
-        "embedded codec byte in {} is {} (expected zstd/gzip)",
-        path.display(),
-        bytes[off + 5]
-    );
-    // Reserved bytes at offset 6, 7 must be 0 (matches the container contract).
     assert_eq!(bytes[off + 6], 0, "reserved byte 6 in {}", path.display());
     assert_eq!(bytes[off + 7], 0, "reserved byte 7 in {}", path.display());
 }
@@ -110,14 +106,19 @@ fn assert_is_self_extractor(path: &PathBuf) {
 /// Find the embedded UPXZ container offset inside an SFX and assert its codec
 /// id. Used by the gzip pack tests, which need to verify the embedded
 /// container's codec byte (the SFX's offset 5 is inside the platform stub and
-/// is not the container codec byte).
+/// is not the container codec byte). Searches for the full 8-byte valid magic
+/// to skip the stub/winstub `MAGIC_PREFIX` const (see `assert_is_self_extractor`).
 fn assert_embedded_codec_is(path: &PathBuf, codec_id: u8) {
     let bytes = fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    let prefix = b"UPXZ\x01";
     let off = bytes
-        .windows(prefix.len())
-        .position(|w| w == prefix)
-        .unwrap_or_else(|| panic!("no embedded UPXZ container in {}", path.display()));
+        .windows(8)
+        .position(|w| w[..5] == *b"UPXZ\x01" && w[5] == codec_id && w[6] == 0 && w[7] == 0)
+        .unwrap_or_else(|| {
+            panic!(
+                "no valid embedded UPXZ container (codec={codec_id}) in {}",
+                path.display()
+            )
+        });
     assert_eq!(
         bytes[off + 5],
         codec_id,
