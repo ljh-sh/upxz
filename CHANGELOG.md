@@ -19,6 +19,15 @@
   heuristic on the restored bytes' magic rather than an exact restoration —
   the alternative is a format change, which is out of scope here.)
 
+- **Linux builds switched to musl static** so the released binaries run on
+  **Alpine** and every glibc distro (Ubuntu/Debian/Fedora/Arch) — the previous
+  `*-unknown-linux-gnu` builds were glibc/dynamically-linked and would not run
+  on Alpine (no glibc). The `*-unknown-linux-musl` binaries are fully static
+  (`ldd`: not a dynamic executable), built with `musl-gcc` for both the C
+  (`zstd-sys`) compile and the final link. Verified end-to-end on Alpine
+  (Docker, both x86_64 and aarch64): the binary runs and the SFX
+  (`memfd_create` + `fexecve`) runs the inner program.
+
 - **Cross-arch release binaries**: the release matrix now ships **aarch64 Linux
   and x86_64 macOS** in addition to x86_64 Linux, aarch64 macOS, and x86_64
   Windows. `aarch64-unknown-linux-gnu` builds on a native ARM runner;

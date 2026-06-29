@@ -51,6 +51,8 @@ upx 风格的**扁平 CLI**（无子命令）——用 flag 选动作：
 
 **预编译二进制**（Linux x86_64/arm64、macOS x86_64/arm64、Windows x86_64 —— cosign 签名，附 `SHA256SUMS`），见 [最新 release](https://github.com/ljh-sh/upxz/releases/latest)：
 
+Linux 构建为 **musl 静态链接** —— 同一个二进制可在 Alpine **和**所有 glibc 发行版（Ubuntu/Debian/Fedora/Arch）上运行，无 `libc` 动态依赖。
+
 ```bash
 # 选你平台的 tarball，然后：
 tar xJf upxz-<target>.tar.xz -C /usr/local/bin --strip-components=1 bin/upxz
