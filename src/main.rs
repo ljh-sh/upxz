@@ -1,17 +1,20 @@
-//! upxz — upx using zstd. A **runner** + packer (mneme#41 final design).
+//! upxz — upx using zstd. A packer that turns a file into a **self-extracting
+//! executable** (upx-style: the output still runs).
 //!
-//! A `.upxz` file is a container: `magic + original-name + zstd(original bytes)`.
-//! - `upxz foo`        → if foo is a plain file: **pack** to `foo.upxz`
-//! - `upxz foo.upxz`   → magic detected: **run** (decompress original to a temp
-//!   file and exec it, propagating exit code)
-//! - `upxz -d foo.upxz`→ **unpack** (restore original bytes)
-//! - `upxz -l/-t`      → list / test (read-only)
+//! - `upxz foo`        → if foo is a plain file: **pack** to a self-extractor
+//!   `foo.upxz` (chmod +x). `./foo.upxz` runs the original directly.
+//! - `upxz foo.upxz`   → **refused**: foo.upxz is already packed. Run it
+//!   directly (`./foo.upxz`) or restore the original with `-d`.
+//! - `upxz -d foo.upxz`→ **unpack**: restore the original (executable bit
+//!   restored when the original was an executable).
+//! - `upxz -l/-t`      → list / test (read-only; work on the SFX).
+//! - `upxz -c foo -o bar` → pack to a self-extractor at an explicit output path.
 //!
-//! Design choice: upxz does **not** rewrite binaries in place and injects no
-//! loader stub. The runner is an ordinary signed binary on each OS; the
-//! restored original execs independently with its own signature. That avoids
-//! all Mach-O/ELF fixup, codesign and PAC entanglement — so it works on macOS,
-//! Linux, and (later) Windows with one container format.
+//! The self-extractor embeds the upxz container (`magic + name + compressed
+//! bytes`) after a tiny platform stub/loader, plus a trailer that records the
+//! stub size so `-d`/`-l`/`-t` and the "already packed" check can locate it.
+//! Running the SFX extracts the original into memory (Linux memfd) or a temp
+//! file (macOS/Windows) and execs it.
 
 mod bin_run;
 mod compress;
@@ -26,7 +29,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::format::{
-    check_packable_input, has_magic, parse_header, sanitize_name, Codec, Header, MAGIC,
+    check_packable_input, classify, parse_header, sanitize_name, Codec, Header, Kind,
 };
 use crate::level::LevelArgs;
 
@@ -34,25 +37,27 @@ use crate::level::LevelArgs;
 #[command(
     name = "upxz",
     version,
-    about = "upx using zstd — runner + packer. Auto-detects pack vs run by magic.",
+    about = "upx using zstd — pack a file into a self-extractor that still runs.",
     after_help = "EXAMPLES:
-  upxz notes.txt                       pack   → notes.txt.upxz (zstd, default level 19)
-  upxz notes.txt.upxz                  run    → decompress + exec the original
-  upxz -d notes.txt.upxz               unpack → restore the original bytes
+  upxz notes.txt                       pack   → notes.txt.upxz (a self-extractor; ./notes.txt.upxz runs)
+  ./notes.txt.upxz                     run    → decompress + exec the original (that is the run)
+  upxz notes.txt.upxz                  refused — already packed; run it directly or use -d
+  upxz -d notes.txt.upxz               unpack → restore the original (executable bit restored)
   upxz -l notes.txt.upxz               list   → codec, sizes, original name
   upxz -t notes.txt.upxz               test   → verify magic + round-trip decompress
   upxz --fast notes.txt                pack at zstd level 1 (lowest CPU, hot loops)
   upxz -z 9 notes.txt                  pack at zstd level 9 (range 1..=19)
   upxz --gz notes.txt                  pack with gzip instead of zstd
-  upxz -c myapp -o myapp.sfx           build a self-extracting binary (./myapp.sfx runs)
+  upxz -c myapp -o myapp.sfx           pack to a self-extractor at an explicit output path
   upxz --bin bin/myapp app.tar.zst -- --flag value   run one entry from a .tar.zst
 
-A plain FILE is packed; a .upxz container is run. The mode is auto-detected
-from the magic — you never tell upxz which. Compression: default zstd 19;
---fast zstd 1; -z N zstd N (1..=19); --gz gzip (1..=9, default 9)."
+A plain FILE is packed into a runnable self-extractor <FILE>.upxz. An
+already-packed file is refused (run it directly instead). Compression: default
+zstd 19; --fast zstd 1; -z N zstd N (1..=19); --gz gzip (1..=9, default 9)."
 )]
 struct Cli {
-    /// Input file. A plain file → packed to <FILE>.upxz; a .upxz container → run.
+    /// Input file. A plain file → packed to a self-extractor <FILE>.upxz
+    /// (runnable via `./<FILE>.upxz`); an already-packed file → refused.
     #[arg(value_name = "FILE")]
     file: PathBuf,
 
@@ -160,12 +165,31 @@ fn main() -> Result<()> {
     if cli.decompress {
         return unpack(&cli.file, cli.force, cli.quiet);
     }
-    // default action: auto-detect by magic
-    let head = read_head(&cli.file, MAGIC.len())?;
-    if has_magic(&head) {
-        run(&cli.file, cli.quiet, &cli.trailing)
-    } else {
-        pack(&cli.file, &cli.level, cli.force, cli.quiet)
+    // default action: a plain file is packed into a self-extractor <FILE>.upxz;
+    // an already-packed upxz artifact (bare container or SFX) is refused — run
+    // it directly or restore the original with -d.
+    let buf = read_input_file(&cli.file)?;
+    match classify(&buf) {
+        Kind::Plain => {
+            let out = default_pack_output(&cli.file);
+            pack_sfx(&cli.file, &out, &cli.level, cli.force, cli.quiet)
+        }
+        Kind::Packed { .. } => {
+            // Use just the file name for the "run it directly" hint so the
+            // message reads `./zhhz.upxz` regardless of whether the user typed
+            // `upxz zhhz.upxz`, `upxz ./zhhz.upxz`, or an absolute path.
+            let name = cli
+                .file
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| cli.file.display().to_string());
+            bail!(
+                "{} is already a packed upxz binary.\n  run it directly:   ./{}\n  restore original:  upxz -d {}",
+                cli.file.display(),
+                name,
+                cli.file.display(),
+            )
+        }
     }
 }
 
@@ -187,63 +211,11 @@ fn read_input_file(path: &Path) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Read at most `n` leading bytes for magic sniffing.
-fn read_head(path: &Path, n: usize) -> Result<Vec<u8>> {
-    let mut f =
-        fs::File::open(path).with_context(|| format!("cannot open input {}", path.display()))?;
-    let mut head = vec![0u8; n];
-    let got = f.read(&mut head).unwrap_or(0);
-    head.truncate(got);
-    Ok(head)
-}
-
-fn pack(input: &Path, level: &LevelArgs, force: bool, quiet: bool) -> Result<()> {
-    let raw = read_input_file(input)?;
-    check_packable_input(&raw)?; // refuse double-pack
-
-    let name = sanitize_name(input)?;
-    let codec = level.codec();
-    let lvl = match codec {
-        Codec::Zstd => level.resolve(),
-        Codec::Gzip => level.gzip_level() as i32,
-    };
-    let payload = compress::compress(codec, &raw, lvl)
-        .with_context(|| format!("{codec} compression failed"))?;
-
-    let out_path = default_pack_output(input);
-    if out_path.exists() && !force {
-        bail!(
-            "output {} already exists; use -f to overwrite",
-            out_path.display()
-        );
-    }
-    let header_bytes = Header { name, codec }.encode();
-    let mut out = fs::File::create(&out_path)
-        .with_context(|| format!("cannot create output {}", out_path.display()))?;
-    out.write_all(&header_bytes)
-        .with_context(|| format!("cannot write header to {}", out_path.display()))?;
-    out.write_all(&payload)
-        .with_context(|| format!("cannot write payload to {}", out_path.display()))?;
-    out.flush()?;
-
-    if !quiet {
-        eprintln!(
-            "packed {} -> {} ({} -> {} bytes, {} {})",
-            input.display(),
-            out_path.display(),
-            raw.len(),
-            header_bytes.len() + payload.len(),
-            codec.name(),
-            lvl
-        );
-    }
-    Ok(())
-}
-
 fn unpack(input: &Path, force: bool, quiet: bool) -> Result<()> {
     let buf = read_input_file(input)?;
-    let (header, payload_offset) = parse_header(&buf)?;
-    let restored = compress::decompress(header.codec, &buf[payload_offset..])?;
+    let container = packed_container_slice(&buf, input)?;
+    let (header, payload_offset) = parse_header(container)?;
+    let restored = compress::decompress(header.codec, &container[payload_offset..])?;
 
     let out_path = unpack_output(input, &header.name)?;
     if out_path.exists() && !force {
@@ -261,82 +233,73 @@ fn unpack(input: &Path, force: bool, quiet: bool) -> Result<()> {
     fs::write(&out_path, &restored)
         .with_context(|| format!("cannot write to {}", out_path.display()))?;
 
+    // Restore the executable bit when the original looked like an executable.
+    // The upxz container stores no mode bits, so a packed executable would
+    // otherwise come back non-executable (the common case for upxz — "upx using
+    // zstd" — is packing executables). Text and other non-executables keep the
+    // default non-exec mode.
+    #[cfg(unix)]
+    let made_exec = if looks_executable(&restored) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&out_path, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("cannot chmod output {}", out_path.display()))?;
+        true
+    } else {
+        false
+    };
+    #[cfg(not(unix))]
+    let made_exec = false;
+
     if !quiet {
         eprintln!(
-            "unpacked {} -> {} ({} -> {} bytes)",
+            "unpacked {} -> {} ({} -> {} bytes{})",
             input.display(),
             out_path.display(),
             buf.len(),
-            restored.len()
+            restored.len(),
+            if made_exec { ", chmod +x" } else { "" }
         );
     }
     Ok(())
 }
 
-/// Run a `.upxz` container: decompress the original to a temp file and exec it,
-/// propagating the child's exit code. Trailing args (after `--`) are forwarded
-/// verbatim to the restored binary. The temp file is removed after the child
-/// exits.
+/// Return the embedded UPXZ container slice of an already-packed file (a bare
+/// container or a self-extractor). Errors for a plain (not-yet-packed) file.
+/// Shared by `-d` / `-l` / `-t` so they all locate the container the same way.
+fn packed_container_slice<'a>(buf: &'a [u8], file: &Path) -> Result<&'a [u8]> {
+    match classify(buf) {
+        Kind::Plain => bail!("{} is not a packed upxz file", file.display()),
+        Kind::Packed { offset, len } => Ok(&buf[offset..offset + len]),
+    }
+}
+
+/// Heuristic: does `bytes` look like an executable whose exec bit should be
+/// restored on unpack? Matches ELF, Mach-O (32/64-bit, both endians), PE/COFF
+/// (`MZ`), and `#!`-shebang scripts. Non-executables (text, archives, images)
+/// return false so they are not needlessly marked executable.
 ///
-/// On macOS a restored copy of a signed Mach-O no longer matches its original
-/// signature, so AMFI kills it with SIGKILL (exit 137) on exec. We re-sign the
-/// temp copy ad-hoc (`codesign --sign - --force`) so the kernel accepts it.
-/// Linux needs no signing.
-fn run(file: &Path, quiet: bool, trailing: &[String]) -> Result<()> {
-    let buf = read_input_file(file)?;
-    let (header, payload_offset) = parse_header(&buf)?;
-    let original = compress::decompress(header.codec, &buf[payload_offset..])?;
-
-    let tmp = std::env::temp_dir().join(format!(
-        ".upxz-run-{}-{}",
-        std::process::id(),
-        sanitize_tmp_name(&header.name)
-    ));
-    fs::write(&tmp, &original)
-        .with_context(|| format!("cannot write restored binary to {}", tmp.display()))?;
-    #[cfg(target_os = "macos")]
-    {
-        // Ad-hoc re-sign the temp copy: macOS AMFI SIGKILLs (exit 137) a copied
-        // signed binary on exec otherwise. `--force` overwrites the stale
-        // signature. A non-zero status is fatal — without a valid signature the
-        // child cannot run at all. Done before the chmod to 0o500 below, because
-        // codesign must write the new signature to the file.
-        let cs = std::process::Command::new("codesign")
-            .args(["--sign", "-", "--force", "--"])
-            .arg(&tmp)
-            .output()
-            .with_context(|| "failed to spawn codesign")?;
-        if !cs.status.success() {
-            bail!(
-                "codesign failed on {} (exit {:?}): {}",
-                tmp.display(),
-                cs.status.code(),
-                String::from_utf8_lossy(&cs.stderr).trim()
-            );
+/// Only called from the Unix chmod branch in `unpack`; on Windows executability
+/// is determined by the `.exe` extension, not permission bits, so this helper
+/// is dead code there. Silence the dead-code lint explicitly.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn looks_executable(bytes: &[u8]) -> bool {
+    const MAGIC_ELF: &[u8; 4] = b"\x7fELF";
+    const MACHO_BE64: &[u8; 4] = b"\xfe\xed\xfa\xcf";
+    const MACHO_LE64: &[u8; 4] = b"\xcf\xfa\xed\xfe";
+    const MACHO_BE32: &[u8; 4] = b"\xfe\xed\xfa\xce";
+    const MACHO_LE32: &[u8; 4] = b"\xce\xfa\xed\xfe";
+    match bytes.get(..4) {
+        Some(m)
+            if m == MAGIC_ELF
+                || m == MACHO_BE64
+                || m == MACHO_LE64
+                || m == MACHO_BE32
+                || m == MACHO_LE32 =>
+        {
+            true
         }
+        _ => bytes.starts_with(b"MZ") || bytes.starts_with(b"#!"),
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o500))
-            .with_context(|| format!("cannot chmod restored binary {}", tmp.display()))?;
-    }
-
-    if !quiet {
-        eprintln!(
-            "run {} ({} bytes restored, exec {})",
-            file.display(),
-            original.len(),
-            header.name
-        );
-    }
-
-    let status = std::process::Command::new(&tmp)
-        .args(trailing)
-        .status()
-        .with_context(|| format!("failed to exec restored binary {}", tmp.display()))?;
-    let _ = fs::remove_file(&tmp);
-    std::process::exit(status.code().unwrap_or(1));
 }
 
 /// Pack an input file into a **self-extracting executable** (SFX).
@@ -687,19 +650,31 @@ fn pack_sfx_windows(
 
 fn list(file: &Path) -> Result<()> {
     let buf = read_input_file(file)?;
-    let (header, payload_offset) = parse_header(&buf)?;
-    let original = compress::decompress(header.codec, &buf[payload_offset..])
+    let container = packed_container_slice(&buf, file)?;
+    let (header, payload_offset) = parse_header(container)?;
+    let original = compress::decompress(header.codec, &container[payload_offset..])
         .context("decompression failed while listing")?;
+    // `container` is the embedded UPXZ container; the whole file may be larger
+    // (a self-extractor adds a stub/loader + trailer). Report both so the user
+    // sees the SFX overhead.
+    let (kind, is_sfx) = match classify(&buf) {
+        Kind::Packed { offset: 0, .. } => ("upxz container", false),
+        Kind::Packed { .. } => ("upxz self-extractor", true),
+        Kind::Plain => unreachable!("packed_container_slice rejected Plain"),
+    };
     let ratio = if original.is_empty() {
         0.0
     } else {
-        buf.len() as f64 / original.len() as f64 * 100.0
+        container.len() as f64 / original.len() as f64 * 100.0
     };
     println!("file\t{}", file.display());
-    println!("magic\tUPXZ (upxz container)");
+    println!("kind\t{kind}");
     println!("codec\t{}", header.codec.name());
     println!("name\t{}", header.name);
-    println!("compressed\t{} bytes", buf.len());
+    println!("packed\t{} bytes", container.len());
+    if is_sfx {
+        println!("file-size\t{} bytes", buf.len());
+    }
     println!("original\t{} bytes", original.len());
     println!("ratio\t{:.1}% of original", ratio);
     Ok(())
@@ -707,8 +682,9 @@ fn list(file: &Path) -> Result<()> {
 
 fn test(file: &Path) -> Result<()> {
     let buf = read_input_file(file)?;
-    let (header, payload_offset) = parse_header(&buf)?;
-    compress::decompress(header.codec, &buf[payload_offset..])
+    let container = packed_container_slice(&buf, file)?;
+    let (header, payload_offset) = parse_header(container)?;
+    compress::decompress(header.codec, &container[payload_offset..])
         .context("decompression test failed")?;
     println!(
         "ok\t{} (magic valid, {} round-trip ok, original name {})",
@@ -737,19 +713,6 @@ fn unpack_output(input: &Path, header_name: &str) -> Result<PathBuf> {
     }
 }
 
-/// Flatten an arbitrary stored name into something safe to embed in a temp path.
-fn sanitize_tmp_name(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,23 +731,30 @@ mod tests {
     }
 
     #[test]
-    fn pack_then_unpack_roundtrips() {
-        let dir = tmpdir("rt");
+    fn sfx_pack_then_unpack_roundtrips() {
+        // The default pack path now produces a self-extractor (not a bare
+        // container). Round-trip through pack_sfx -> unpack must restore the
+        // original, and the SFX must be classified as already-packed (so
+        // `upxz <sfx>` refuses instead of re-packing).
+        let dir = tmpdir("sfx-rt");
         let in_path = dir.join("hello.txt");
         let body = b"hello upxz\n".repeat(64);
         std::fs::write(&in_path, &body).unwrap();
 
         let packed = dir.join("hello.txt.upxz");
-        pack(&in_path, &LevelArgs::default(), false, true).unwrap();
+        pack_sfx(&in_path, &packed, &LevelArgs::default(), false, true).unwrap();
         assert!(packed.is_file());
+
         let packed_bytes = std::fs::read(&packed).unwrap();
-        assert_eq!(&packed_bytes[..MAGIC.len()], &MAGIC[..]);
+        assert!(
+            matches!(classify(&packed_bytes), Kind::Packed { .. }),
+            "SFX output must classify as already-packed"
+        );
+        // refuse double-pack: the SFX is not a packable plain file.
+        assert!(check_packable_input(&packed_bytes).is_err());
 
-        // refuse double-pack
-        assert!(pack(&packed, &LevelArgs::default(), false, true).is_err());
-
-        // unpack default strips .upxz -> restores to "hello.txt" next to it.
-        // pack keeps the original, so it still exists and must be overwritten.
+        // unpack strips .upxz -> restores hello.txt (-f overwrites the original,
+        // which pack left in place).
         unpack(&packed, true, true).unwrap();
         assert_eq!(std::fs::read(dir.join("hello.txt")).unwrap(), body);
 
@@ -792,32 +762,60 @@ mod tests {
     }
 
     #[test]
-    fn pack_gzip_then_unpack_roundtrips() {
-        // --gz: the codec byte in the magic must be 1, and the round-trip
-        // through gzip (flate2 / miniz_oxide) must restore the original.
-        let dir = tmpdir("rt-gz");
-        let in_path = dir.join("hello.txt");
-        let body = b"hello upxz gzip\n".repeat(64);
-        std::fs::write(&in_path, &body).unwrap();
-
-        let gz_args = LevelArgs {
-            gzip: true,
-            ..LevelArgs::default()
-        };
-        let packed = dir.join("hello.txt.upxz");
-        pack(&in_path, &gz_args, false, true).unwrap();
-        assert!(packed.is_file());
-        let packed_bytes = std::fs::read(&packed).unwrap();
-        // codec byte at offset 5 must be 1 (gzip); prefix is UPXZ\x01.
-        assert_eq!(&packed_bytes[..5], b"UPXZ\x01");
-        assert_eq!(packed_bytes[5], 1, "gzip codec byte must be 1");
-        assert_eq!(packed_bytes[6], 0);
-        assert_eq!(packed_bytes[7], 0);
-
-        unpack(&packed, true, true).unwrap();
-        assert_eq!(std::fs::read(dir.join("hello.txt")).unwrap(), body);
-
+    fn classify_detects_plain_container_and_sfx() {
+        // plain bytes -> Plain
+        assert!(matches!(classify(b"hello world"), Kind::Plain));
+        // bare container (starts with the UPXZ magic) -> Packed at offset 0
+        let container = Header {
+            name: "x".to_owned(),
+            codec: Codec::Zstd,
+        }
+        .encode();
+        assert!(matches!(
+            classify(&container),
+            Kind::Packed { offset: 0, .. }
+        ));
+        // self-extractor -> Packed at offset > 0 (past the stub/loader)
+        let dir = tmpdir("classify");
+        let in_path = dir.join("in.txt");
+        std::fs::write(&in_path, b"some data here").unwrap();
+        let sfx = dir.join("in.txt.upxz");
+        pack_sfx(&in_path, &sfx, &LevelArgs::default(), false, true).unwrap();
+        let sfx_bytes = std::fs::read(&sfx).unwrap();
+        assert!(matches!(
+            classify(&sfx_bytes),
+            Kind::Packed { offset, .. } if offset > 0
+        ));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn looks_executable_detects_common_formats() {
+        assert!(looks_executable(b"\x7fELF\x02\x01\x01")); // ELF
+        assert!(looks_executable(b"\xcf\xfa\xed\xfe\x07")); // Mach-O 64 LE
+        assert!(looks_executable(b"\xfe\xed\xfa\xcf")); // Mach-O 64 BE
+        assert!(looks_executable(b"MZ\x90\x00")); // PE/COFF
+        assert!(looks_executable(b"#!/bin/sh\necho hi")); // shebang script
+        assert!(!looks_executable(b"plain text file"));
+        assert!(!looks_executable(b"UPXZ\x01\x00\x00")); // a container, not an exec
+    }
+
+    #[test]
+    fn gzip_codec_roundtrips_at_format_level() {
+        // gzip compress/decompress + the codec byte, at the format layer. (The
+        // macOS SFX loader is zstd-only, so a gzip SFX cannot be built on macOS;
+        // the codec round-trip itself is platform-independent.)
+        let body = b"hello upxz gzip\n".repeat(64);
+        let payload = compress::compress(Codec::Gzip, &body, 9).unwrap();
+        let restored = compress::decompress(Codec::Gzip, &payload).unwrap();
+        assert_eq!(restored, body);
+        let header = Header {
+            name: "x".to_owned(),
+            codec: Codec::Gzip,
+        }
+        .encode();
+        assert_eq!(&header[..5], b"UPXZ\x01");
+        assert_eq!(header[5], 1, "gzip codec byte must be 1");
     }
 
     #[test]

@@ -10,18 +10,22 @@
 ## TL;DR
 
 ```bash
-upxz notes.txt               # pack   → notes.txt.upxz (zstd, default level 19)
-upxz notes.txt.upxz          # run    → decompress + exec the original
-upxz -d notes.txt.upxz       # unpack → restore the original bytes
+upxz notes.txt               # pack   → notes.txt.upxz (a self-extractor; ./notes.txt.upxz runs)
+./notes.txt.upxz             # run    → decompress + exec the original (that IS the run)
+upxz notes.txt.upxz          # refused — already packed; run it directly or use -d
+upxz -d notes.txt.upxz       # unpack → restore the original (chmod +x for executables)
 upxz -l notes.txt.upxz       # list   → codec / sizes / original name
 upxz -t notes.txt.upxz       # test   → verify magic + round-trip
-upxz -c myapp -o myapp.sfx   # build a self-extracting binary (./myapp.sfx runs)
+upxz -c myapp -o myapp.sfx   # pack to a self-extractor at an explicit output path
 upxz --fast big.bin          # pack at zstd level 1 (lowest CPU)
 upxz --gz notes.txt          # pack with gzip instead of zstd
 ```
 
-A plain `FILE` is **packed**; a `.upxz` container is **run**. The mode is
-auto-detected from the magic — you never tell `upxz` which.
+A plain `FILE` is **packed** into a self-extractor `<FILE>.upxz` — run it
+directly. An already-packed file is **refused** (the SFX runs itself; there is
+no `upxz run` subcommand, by design). The read paths (`-d`/`-l`/`-t`) all
+locate the embedded UPXZ container automatically (bare v0.1–v0.3 containers
+and self-extractors share one read path).
 
 ## What is this
 
@@ -30,21 +34,24 @@ auto-detected from the magic — you never tell `upxz` which.
 narrow:
 
 - **One file in, one file out.** No directories, no globs, no batch mode.
-- **Magic-checked.** The container starts with an 8-byte magic (`UPXZ\x01…`).
-  Re-packing an existing container is refused.
+- **upx-style output.** The default pack produces a **self-extracting
+  executable** (`<FILE>.upxz`, chmod +x). `./<FILE>.upxz` runs the original
+  directly — there is no separate runner step inside upxz itself.
+- **Magic-checked.** Re-packing an already-packed file (bare container or
+  self-extractor) is refused.
 - **Single binary.** Statically links zstd; no Python, no extra runtimes.
 
-upx-style **flat CLI** (no subcommands) — a flag picks the action, and pack vs
-run is auto-detected from the input's magic:
+upx-style **flat CLI** (no subcommands) — a flag picks the action:
 
 | invocation                       | action                                                        |
 | -------------------------------- | ------------------------------------------------------------- |
-| `upxz <FILE>`                    | **pack** → `<FILE>.upxz` (magic + original name + zstd payload) |
-| `upxz <FILE>.upxz`               | **run** → decompress + exec the original (propagates exit code) |
-| `upxz -d <FILE>.upxz`            | **unpack** → restore the original bytes to disk               |
+| `upxz <FILE>`                    | **pack** → `<FILE>.upxz` (self-extractor: stub + container + trailer, chmod +x) |
+| `./<FILE>.upxz`                  | **run** → decompress + exec the original (that IS the run; propagates exit code) |
+| `upxz <FILE>.upxz`               | **refused** — already packed; run the .upxz directly or use `-d` |
+| `upxz -d <FILE>.upxz`            | **unpack** → restore the original (executable bit restored for executables) |
 | `upxz -l <FILE>.upxz`            | **list** → codec / sizes / original name (read-only)          |
 | `upxz -t <FILE>.upxz`            | **test** → verify magic + round-trip decompress (read-only)   |
-| `upxz -c <orig> -o <packed>`     | **SFX** → a self-extracting binary                            |
+| `upxz -c <orig> -o <packed>`     | **pack** → self-extractor at an explicit output path          |
 | `upxz --bin <inner> <a.tar.zst>` | **bin run** → run one entry from a `.tar.zst` without extracting |
 
 ## Install
@@ -67,36 +74,39 @@ cosign verify-blob --bundle upxz-<target>.tar.xz.sigstore.json upxz-<target>.tar
 cargo install --git https://github.com/ljh-sh/upxz
 ```
 
-> **`cargo install upxz` (from crates.io) gives the runner/packer but not SFX.**
+> **`cargo install upxz` (from crates.io) gives the packer but not the SFX runtime.**
 > A `cargo publish` tarball strips the nested SFX companion crates
-> (`stub/`/`loader/`/`winstub/`), so the self-extracting-binary feature
-> (`-c`/`--create-sfx`) cannot be compiled from a crates.io install — `upxz -c`
-> refuses with a clear message. Pack / run / `--bin` / list / test all work.
-> For SFX, use a release binary or `cargo install --git` (both ship full source).
-> Tracked in [#11](https://github.com/ljh-sh/upxz/issues/11).
+> (`stub/`/`loader/`/`winstub/`), so the self-extracting-binary output
+> (`<FILE>.upxz`) cannot be built from a crates.io install — `upxz <FILE>`
+> refuses with a clear message. `-d`/`-l`/`-t`/`--bin` on a pre-existing SFX
+> still work (they read the embedded container without needing the stub).
+> For SFX packing, use a release binary or `cargo install --git` (both ship full
+> source). Tracked in [#11](https://github.com/ljh-sh/upxz/issues/11).
 
 ## Usage
 
 ```bash
-# pack a file (zstd, default level 19) — auto-detected because notes.txt is a plain file
-upxz notes.txt                   # -> notes.txt.upxz
+# pack a file (zstd, default level 19) — produces a self-extractor with chmod +x
+upxz notes.txt                   # -> notes.txt.upxz (a self-extractor)
 
-# run a container — auto-detected because the magic says it's packed
-upxz notes.txt.upxz              # decompresses + execs the original; propagates exit code
-upxz notes.txt.upxz -- --flag value   # args after -- forwarded verbatim to the inner program
+# run the self-extractor directly (that IS the run — upxz has no run mode)
+./notes.txt.upxz                 # decompresses + execs the original; propagates exit code
+./notes.txt.upxz -- --flag value # args after -- forwarded verbatim to the inner program
 
-# inspect / verify / restore (read-mostly)
+# inspect / verify / restore (read-mostly) — all locate the embedded container
 upxz -l notes.txt.upxz           # list: codec / sizes / original name
 upxz -t notes.txt.upxz           # test: magic + round-trip decompress
-upxz -d notes.txt.upxz           # unpack: restore the original bytes (-> notes.txt)
+upxz -d notes.txt.upxz           # unpack: restore the original bytes (-> notes.txt);
+                                 #         chmod +x when the original was an executable
 upxz -d notes.txt.upxz -f        # overwrite an existing notes.txt
 
 # pick a compression level
 upxz --fast notes.txt            # zstd level 1 — lowest CPU, hot loops
 upxz -z 9 notes.txt              # zstd level 9  (any 1..=19)
-upxz --gz notes.txt              # gzip instead of zstd (codec id 1 in the magic)
+upxz --gz notes.txt              # gzip instead of zstd (codec id 1 in the embedded magic)
 
-# build a self-extracting binary
+# build a self-extractor at an explicit output path (same as bare pack, but
+# pick the output name — useful for renaming or building from a non-suffix path)
 upxz -c myapp -o myapp.sfx && ./myapp.sfx --flag value
 ```
 
@@ -117,8 +127,9 @@ below.
 
 ### Codec: zstd (default) or gzip (`--gz`)
 
-The container is **codec-agnostic**: a single byte in the magic records which
-codec compressed the payload, so one `upxz` binary handles both.
+The embedded UPXZ container is **codec-agnostic**: a single byte in the
+embedded magic records which codec compressed the payload, so one `upxz` binary
+handles both.
 
 | codec | magic byte | flag      | level range            |
 | ----- | ---------- | --------- | ---------------------- |
@@ -126,23 +137,24 @@ codec compressed the payload, so one `upxz` binary handles both.
 | gzip  | `1`        | `--gz`    | 1..=9 (default 9)      |
 
 ```bash
-# pack with gzip instead of zstd
-upxz --gz notes.txt              # -> notes.txt.upxz (codec id 1 in the magic)
+# pack with gzip instead of zstd (embedded codec byte = 1)
+upxz --gz notes.txt              # -> notes.txt.upxz
 
 # zstd is still the default and is fully backward-compatible
-upxz notes.txt                   # -> notes.txt.upxz (codec id 0, same as v0.2)
+upxz notes.txt                   # -> notes.txt.upxz (embedded codec byte = 0, same as v0.2)
 ```
 
-Every read path (run / unpack / list / test) dispatches on the codec byte, so
-you do not need to tell `upxz` which codec a container used — it reads it from
-the magic. The gzip backend is `flate2` with the pure-Rust `miniz_oxide`
+Every read path (`-d`/`-l`/`-t`) dispatches on the embedded codec byte, so you
+do not need to tell `upxz` which codec a container used — it reads it from the
+embedded magic. The gzip backend is `flate2` with the pure-Rust `miniz_oxide`
 backend (no C `libz`); zstd is unchanged.
 
 **macOS SFX caveat**: the macOS SFX loader is `no_std` + `zstd-sys` FFI for
 size (~84 KB, under the 1/5-of-upxz gate). It cannot carry a gzip decoder, so
-`upxz -c --gz` on macOS refuses with a clear message. Use the cross-platform
-runner path (`upxz foo.upxz`) for gzip on macOS, or pack with zstd (drop
-`--gz`). The Linux SFX stub supports both codecs.
+`upxz --gz` on macOS (or `upxz -c --gz`) refuses with a clear message. There
+is no `upxz`-side workaround for gzip on macOS — the SFX runs the embedded
+binary itself (no runner path), and the loader is zstd-only. Drop `--gz` on
+macOS. The Linux SFX stub and the Windows winstub both support gzip.
 
 ## Why zstd-first (no xz / liblzma)
 
