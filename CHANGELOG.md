@@ -1,5 +1,24 @@
 # Unreleased
 
+- **pack now produces a self-extractor (upx-style default).** `upxz <FILE>`
+  emits a runnable `<FILE>.upxz` (chmod +x) instead of a plain container; you
+  run it directly (`./<FILE>.upxz`). The previous `upxz <packed>` runner
+  mode is gone — feeding upxz an already-packed file (bare container or
+  self-extractor) is now **refused** with a clear hint to run the SFX directly
+  or restore the original with `-d`. This makes `upxz ./zhhz` produce a
+  `./zhhz.upxz` that actually runs on macOS (the long-standing "can't be used"
+  gap when the SFX wasn't the default). The new `classify()` in `format.rs`
+  detects both bare containers and SFXes via their trailers, so the read
+  paths (`-d`/`-l`/`-t`) and the refuse check share one source of truth and
+  keep working on v0.1–v0.3 plain containers (backward compatible).
+
+- **`-d` restores the executable bit.** When the original was an executable
+  (ELF / Mach-O / PE / `#!`-shebang), `upxz -d` now chmod's the restored file
+  to `0755` so it runs without an extra `chmod +x`. Non-executables keep the
+  default non-exec mode. (upxz's container stores no mode bits, so this is a
+  heuristic on the restored bytes' magic rather than an exact restoration —
+  the alternative is a format change, which is out of scope here.)
+
 - **Cross-arch release binaries**: the release matrix now ships **aarch64 Linux
   and x86_64 macOS** in addition to x86_64 Linux, aarch64 macOS, and x86_64
   Windows. `aarch64-unknown-linux-gnu` builds on a native ARM runner;

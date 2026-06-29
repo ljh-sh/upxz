@@ -50,6 +50,13 @@ pub const CODEC_OFFSET: usize = 5;
 /// default pack path produces a backward-compatible file.
 pub const MAGIC: [u8; 8] = *b"UPXZ\x01\x00\x00\x00";
 
+/// Magic at the start of the 16-byte macOS SFX trailer
+/// (`UPXZEND1` + `loader_len` u32 BE + `app_len` u32 BE). Used by
+/// [`classify`] to tell a macOS self-extractor from a plain file. (Linux and
+/// Windows SFXes use an 8-byte `u64 stub_size` trailer — no magic, so they are
+/// detected by verifying a container starts at `stub_size`.)
+pub const SFX_TRAILER_MAGIC: &[u8; 8] = b"UPXZEND1";
+
 /// A payload codec. The numeric id is what is written into the magic byte at
 /// [`CODEC_OFFSET`]; the variant is the Rust-side dispatch key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +210,74 @@ pub fn has_magic(bytes: &[u8]) -> bool {
     Codec::from_magic_byte(&bytes[..MAGIC_LEN]).is_ok()
 }
 
+/// What [`classify`] found: a packable plain file, or an already-packed upxz
+/// artifact (bare container **or** self-extractor) whose embedded UPXZ
+/// container lives at `offset` for `len` bytes.
+pub enum Kind {
+    /// A plain, not-yet-packed file — fair game to pack.
+    Plain,
+    /// An already-packed upxz artifact. The embedded UPXZ container is exactly
+    /// `buf[offset..offset+len]`. For a bare container this is `(0, buf.len())`;
+    /// for an SFX the stub/loader is skipped and the trailer excluded, located
+    /// via the trailer.
+    Packed { offset: usize, len: usize },
+}
+
+/// True if a valid upxz container magic begins at `offset` in `buf`.
+fn container_at(buf: &[u8], offset: usize) -> bool {
+    offset + MAGIC_LEN <= buf.len() && has_magic(&buf[offset..])
+}
+
+/// Classify a file's bytes as plain (packable) or already-packed (container or
+/// SFX), and for packed inputs locate the embedded UPXZ container. The read
+/// paths (`-d`/`-l`/`-t`) and the "already packed" refuse check share this one
+/// source of truth.
+///
+/// Detection order matters: the macOS SFX trailer (`UPXZEND1` magic) is checked
+/// before the Linux/Windows 8-byte `u64 stub_size` trailer, because a macOS
+/// SFX's last 8 bytes are `[loader_len][app_len]`, not a stub size. Every SFX
+/// branch verifies a UPXZ container magic at the computed offset, so a random
+/// file whose tail happens to parse as a u64 cannot false-positive.
+pub fn classify(buf: &[u8]) -> Kind {
+    let n = buf.len();
+    // 1. Bare container (v0.1-v0.3 format): starts with the UPXZ magic.
+    if has_magic(buf) {
+        return Kind::Packed { offset: 0, len: n };
+    }
+    // 2. macOS SFX: 16-byte trailer [UPXZEND1][loader_len u32 BE][app_len u32 BE].
+    //    loader_len + app_len + 16 must equal the file size; the container
+    //    (header+payload, length app_len) must start at loader_len.
+    if n >= 16 && &buf[n - 16..n - 8] == SFX_TRAILER_MAGIC {
+        let loader_len = u32_be(&buf[n - 8..n - 4]) as usize;
+        let app_len = u32_be(&buf[n - 4..n]) as usize;
+        if loader_len.checked_add(app_len).is_some_and(|s| s + 16 == n)
+            && container_at(buf, loader_len)
+        {
+            return Kind::Packed {
+                offset: loader_len,
+                len: app_len,
+            };
+        }
+    }
+    // 3. Linux/Windows SFX: 8-byte trailer [u64 stub_size BE]. The container
+    //    occupies [stub_size, n - 8).
+    if n >= 8 {
+        let stub_size = u64::from_be_bytes(buf[n - 8..n].try_into().unwrap()) as usize;
+        if stub_size + 8 <= n && container_at(buf, stub_size) {
+            return Kind::Packed {
+                offset: stub_size,
+                len: n - 8 - stub_size,
+            };
+        }
+    }
+    Kind::Plain
+}
+
+/// Read a big-endian u32 from a 4-byte slice.
+fn u32_be(b: &[u8]) -> u32 {
+    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+}
+
 /// Extract the final path component of a path as a String, refusing empty
 /// names, path separators, and parent-directory segments. This keeps the
 /// stored name flat — upxz has no concept of directories, so a malicious or
@@ -225,13 +300,14 @@ pub fn sanitize_name(path: &Path) -> Result<String> {
     Ok(file_name.to_owned())
 }
 
-/// Validate that raw input bytes look like something we should pack. Today we
-/// only refuse already-packed upxz containers; any other byte stream is fair
-/// game because the container records the original magic implicitly via the
-/// payload.
+/// Validate that raw input bytes look like something we should pack. Refuses
+/// already-packed upxz artifacts — both bare containers and self-extractors —
+/// so `upxz` never double-packs. Any other byte stream is fair game.
 pub fn check_packable_input(bytes: &[u8]) -> Result<()> {
-    if has_magic(bytes) {
-        bail!("input is already a upxz container; refusing to double-pack");
+    match classify(bytes) {
+        Kind::Plain => Ok(()),
+        Kind::Packed { .. } => {
+            bail!("input is already packed (upxz container or self-extractor); refusing to double-pack")
+        }
     }
-    Ok(())
 }

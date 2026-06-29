@@ -10,36 +10,41 @@
 ## TL;DR（速览）
 
 ```bash
-upxz notes.txt               # 打包   → notes.txt.upxz（zstd，默认 level 19）
-upxz notes.txt.upxz          # 运行   → 解压并执行原始文件
-upxz -d notes.txt.upxz       # 解包   → 还原原始字节
+upxz notes.txt               # 打包   → notes.txt.upxz（自解压二进制；./notes.txt.upxz 直接跑）
+./notes.txt.upxz             # 运行   → 解压并执行原始文件（这才是真正的“运行”）
+upxz notes.txt.upxz          # 拒绝   —— 已加壳，请直接跑它或用 -d 还原
+upxz -d notes.txt.upxz       # 解包   → 还原原始字节（可执行文件会自动 chmod +x）
 upxz -l notes.txt.upxz       # 列信息 → codec / 体积 / 原始文件名
 upxz -t notes.txt.upxz       # 测试   → 校验 magic + 往返解压
-upxz -c myapp -o myapp.sfx   # 生成自解压二进制（./myapp.sfx 直接跑）
+upxz -c myapp -o myapp.sfx   # 打包到指定输出路径（仍为自解压二进制）
 upxz --fast big.bin          # zstd level 1 打包（最省 CPU）
 upxz --gz notes.txt          # 用 gzip 而非 zstd 打包
 ```
 
-普通 `FILE` → **打包**；`.upxz` 容器 → **运行**。模式由 magic 自动判定，无需告诉 upxz。
+普通 `FILE` → **打包**为自解压二进制 `<FILE>.upxz`（直接 `./<FILE>.upxz` 运行）。
+已加壳的文件 → **拒绝**（SFX 自己跑；upxz 故意没有 `upxz run` 子命令）。
+读取路径（`-d`/`-l`/`-t`）都能自动定位嵌入式 UPXZ 容器（v0.1–v0.3 的纯容器和自解压二进制共用同一条读取路径）。
 
 ## 这是什么
 
 `upxz` 把单个文件包进一个小容器，再用 [zstd](https://datatracker.ietf.org/doc/html/rfc8878) 压缩。范围故意收得很窄：
 
 - **一个文件进，一个文件出。** 没有目录、没有通配符、没有批量模式。
-- **校验文件头 magic。** 容器以 8 字节 magic（`UPXZ\x01…`）开头；对已经打包过的容器再次打包会被拒绝。
+- **upx 风格的产物。** 默认打包输出**自解压可执行文件**（`<FILE>.upxz`，`chmod +x`）。`./<FILE>.upxz` 直接执行原文件 —— upxz 内部没有单独的“运行”步骤。
+- **校验文件头 magic。** 对已加壳文件（纯容器或自解压）再次打包会被拒绝。
 - **单二进制。** 静态链接 zstd，不需要 Python，没有额外运行时。
 
-upx 风格的**扁平 CLI**（无子命令）——用 flag 选动作，打包 vs 运行由输入 magic 自动判定：
+upx 风格的**扁平 CLI**（无子命令）——用 flag 选动作：
 
 | 用法                            | 动作                                                          |
 | ------------------------------- | ------------------------------------------------------------- |
-| `upxz <FILE>`                   | **打包** → `<FILE>.upxz`（magic + 原始文件名 + zstd 负载）    |
-| `upxz <FILE>.upxz`              | **运行** → 解压并执行原始文件（透传退出码）                   |
-| `upxz -d <FILE>.upxz`           | **解包** → 还原原始字节到磁盘                                 |
+| `upxz <FILE>`                   | **打包** → `<FILE>.upxz`（自解压：stub + 容器 + trailer，`chmod +x`） |
+| `./<FILE>.upxz`                 | **运行** → 解压并执行原始文件（这才是真正的“运行”；透传退出码）    |
+| `upxz <FILE>.upxz`              | **拒绝** —— 已加壳；请直接跑 SFX 或用 `-d` 还原                |
+| `upxz -d <FILE>.upxz`           | **解包** → 还原原始字节到磁盘（可执行文件自动恢复 `chmod +x`）   |
 | `upxz -l <FILE>.upxz`           | **列信息** → codec / 体积 / 原始文件名（只读）                |
 | `upxz -t <FILE>.upxz`           | **测试** → 校验 magic + 往返解压（只读）                      |
-| `upxz -c <orig> -o <packed>`    | **SFX** → 自解压二进制                                        |
+| `upxz -c <orig> -o <packed>`    | **打包** → 自解压二进制到指定输出路径                          |
 | `upxz --bin <inner> <a.tar.zst>`| **bin 运行** → 不解包整个 `.tar.zst`，只跑其中指定条目        |
 
 ## 安装
@@ -61,34 +66,35 @@ cosign verify-blob --bundle upxz-<target>.tar.xz.sigstore.json upxz-<target>.tar
 cargo install --git https://github.com/ljh-sh/upxz
 ```
 
-> **`cargo install upxz`（来自 crates.io）只有 runner/packer，没有 SFX。**
+> **`cargo install upxz`（来自 crates.io）只有打包器，没有 SFX 运行时。**
 > `cargo publish` 的 tarball 会丢弃内嵌的 SFX 配套 crate（`stub/`/`loader/`/`winstub/`），
-> 所以从 crates.io 装的版本无法编译自解压功能（`-c`/`--create-sfx`）—— `upxz -c` 会
-> 报错提示。打包 / 运行 / `--bin` / list / test 都正常。要 SFX，请用 release 二进制
-> 或 `cargo install --git`（两者都带完整源码）。见 [#11](https://github.com/ljh-sh/upxz/issues/11)。
+> 所以从 crates.io 装的版本无法生成自解压产物（`upxz <FILE>`）—— 会报错提示。
+> `-d`/`-l`/`-t`/`--bin` 对已有的 SFX 仍可用（读嵌入式容器不需要 stub）。
+> 要生成 SFX，请用 release 二进制或 `cargo install --git`（两者都带完整源码）。
+> 见 [#11](https://github.com/ljh-sh/upxz/issues/11)。
 
 ## 用法
 
 ```bash
-# 打包（zstd，默认 level 19）—— notes.txt 是普通文件，自动判定为打包
-upxz notes.txt                   # -> notes.txt.upxz
+# 打包（zstd，默认 level 19）—— 生成自解压二进制（chmod +x）
+upxz notes.txt                   # -> notes.txt.upxz（自解压）
 
-# 运行容器 —— magic 表明它是打包过的，自动判定为运行
-upxz notes.txt.upxz              # 解压并执行原始文件；透传退出码
-upxz notes.txt.upxz -- --flag value   # -- 之后的参数原样转给原始程序
+# 直接运行自解压二进制（这才是真正的“运行”—— upxz 没有运行模式）
+./notes.txt.upxz                 # 解压并执行原始文件；透传退出码
+./notes.txt.upxz -- --flag value # -- 之后的参数原样转给原始程序
 
-# 查看 / 校验 / 还原（多为只读）
+# 查看 / 校验 / 还原（多为只读）—— 全部自动定位嵌入式容器
 upxz -l notes.txt.upxz           # 列信息：codec / 体积 / 原始文件名
 upxz -t notes.txt.upxz           # 测试：magic + 往返解压
-upxz -d notes.txt.upxz           # 解包：还原原始字节（-> notes.txt）
+upxz -d notes.txt.upxz           # 解包：还原原始字节（-> notes.txt）；可执行文件会自动 chmod +x
 upxz -d notes.txt.upxz -f        # 覆盖已存在的 notes.txt
 
 # 选压缩级别
 upxz --fast notes.txt            # zstd level 1 —— 最省 CPU，高频调用
 upxz -z 9 notes.txt              # zstd level 9（任意 1..=19）
-upxz --gz notes.txt              # 用 gzip 而非 zstd（magic 里 codec id 为 1）
+upxz --gz notes.txt              # 用 gzip 而非 zstd（嵌入式 magic 里 codec id 为 1）
 
-# 生成自解压二进制
+# 打包到指定输出路径（仍是自解压二进制，只是换了个名字）
 upxz -c myapp -o myapp.sfx && ./myapp.sfx --flag value
 ```
 

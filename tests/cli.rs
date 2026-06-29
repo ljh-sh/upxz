@@ -1,17 +1,22 @@
-//! End-to-end CLI tests for the flat (runner-base) upxz CLI.
+//! End-to-end CLI tests for the upx-style upxz CLI.
 //!
-//! Drives the compiled `upxz` binary via `assert_cmd` through every mode the
-//! new (mneme#41) CLI exposes:
+//! Drives the compiled `upxz` binary via `assert_cmd` through every mode:
 //!
-//! - pack  : `upxz <file>`           -> writes `<file>.upxz`
-//! - run   : `upxz <file>.upxz`      -> decompress + exec (propagates exit code)
-//! - --bin : `upxz --bin <inner> <a.tar.zst> -- args` -> stream-extract one
+//! - pack    : `upxz <file>`              -> writes `<file>.upxz` (a
+//!   **self-extractor** with chmod +x; `./<file>.upxz` runs the original)
+//! - refuse  : `upxz <file>.upxz`         -> refused (already packed; run the
+//!   .upxz directly, or use `-d` to restore the original)
+//! - -c      : `upxz -c <file> -o <out>`  -> self-extractor at an explicit path
+//! - -d      : `upxz -d <file>.upxz`      -> unpack (executable bit restored
+//!   when the original was an executable)
+//! - -l / -t : list / test on the SFX (locate the embedded UPXZ container)
+//! - --bin   : `upxz --bin <inner> <a.tar.zst> -- args` -> stream-extract one
 //!   entry from a .tar.zst and exec it (no full extraction)
-//! - -d    : unpack, byte-for-byte round-trip
-//! - -l/-t : list / test, exit 0 + expected fields
-//! - level : `--fast`, `-z N`, default — all must produce a valid container
 //!
-//! The container magic is `UPXZ\x01\x00\x00\x00` (8 bytes).
+//! The self-extractor embeds a UPXZ container (`UPXZ\x01 + codec + 0 + 0`,
+//! then `name_len + name + compressed payload`) after a tiny platform
+//! stub/loader and a short trailer. The container magic is `UPXZ\x01\x00\x00\x00`
+//! (8 bytes) but lives at `stub_size` — not at offset 0.
 
 use std::fs;
 use std::path::PathBuf;
@@ -62,23 +67,66 @@ impl Drop for Sandbox {
     }
 }
 
-/// The 8-byte upxz container magic.
-const MAGIC: &[u8] = b"UPXZ\x01\x00\x00\x00";
-
-fn assert_has_magic(path: &PathBuf) {
+/// Assert that `path` is a self-extracting executable: executable bits set, and
+/// it embeds a UPXZ container somewhere past the leading stub/loader. Used for
+/// the default-pack output, which is a self-extractor (not a bare container).
+fn assert_is_self_extractor(path: &PathBuf) {
     let bytes = fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path).unwrap().permissions().mode();
+        assert!(
+            mode & 0o111 != 0,
+            "self-extractor {} is not executable (mode={:o})",
+            path.display(),
+            mode
+        );
+    }
+    // The SFX embeds the UPXZ container past the platform stub/loader, so the
+    // UPXZ prefix appears at offset > 0.
+    let prefix = b"UPXZ\x01";
+    let off = bytes
+        .windows(prefix.len())
+        .position(|w| w == prefix)
+        .unwrap_or_else(|| panic!("no embedded UPXZ container in {}", path.display()));
     assert!(
-        bytes.len() >= MAGIC.len(),
-        "{} is too small to be a container ({} bytes)",
-        path.display(),
-        bytes.len()
-    );
-    assert_eq!(
-        &bytes[..MAGIC.len()],
-        MAGIC,
-        "magic mismatch in {}",
+        off > 0,
+        "UPXZ prefix at offset 0 means this is a bare container, not an SFX: {}",
         path.display()
     );
+    // The embedded container must also be a valid codec id (0 = zstd, 1 = gzip).
+    assert!(
+        bytes[off + 5] == 0 || bytes[off + 5] == 1,
+        "embedded codec byte in {} is {} (expected zstd/gzip)",
+        path.display(),
+        bytes[off + 5]
+    );
+    // Reserved bytes at offset 6, 7 must be 0 (matches the container contract).
+    assert_eq!(bytes[off + 6], 0, "reserved byte 6 in {}", path.display());
+    assert_eq!(bytes[off + 7], 0, "reserved byte 7 in {}", path.display());
+}
+
+/// Find the embedded UPXZ container offset inside an SFX and assert its codec
+/// id. Used by the gzip pack tests, which need to verify the embedded
+/// container's codec byte (the SFX's offset 5 is inside the platform stub and
+/// is not the container codec byte).
+fn assert_embedded_codec_is(path: &PathBuf, codec_id: u8) {
+    let bytes = fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let prefix = b"UPXZ\x01";
+    let off = bytes
+        .windows(prefix.len())
+        .position(|w| w == prefix)
+        .unwrap_or_else(|| panic!("no embedded UPXZ container in {}", path.display()));
+    assert_eq!(
+        bytes[off + 5],
+        codec_id,
+        "embedded codec byte in {} must be {}",
+        path.display(),
+        codec_id
+    );
+    assert_eq!(bytes[off + 6], 0, "reserved byte 6 in {}", path.display());
+    assert_eq!(bytes[off + 7], 0, "reserved byte 7 in {}", path.display());
 }
 
 // ---------------------------------------------------------------------------
@@ -86,33 +134,39 @@ fn assert_has_magic(path: &PathBuf) {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn pack_plain_file_writes_upxz_with_magic() {
-    let sb = Sandbox::new("pack-magic");
+fn pack_plain_file_writes_self_extractor() {
+    // The default pack now produces a self-extractor (not a bare container).
+    // It must be executable and embed a UPXZ container past the stub/loader.
+    let sb = Sandbox::new("pack-sfx");
     let input = sb.write("hello.txt", b"hello upxz\n".repeat(64).as_slice());
     let expected = sb.expected("hello.txt.upxz");
 
     bin().arg(&input).assert().success();
 
     assert!(expected.is_file(), "{} should exist", expected.display());
-    assert_has_magic(&expected);
+    assert_is_self_extractor(&expected);
 }
 
 #[test]
-fn pack_refuses_double_pack() {
-    // A `.upxz` container starts with the magic, so `check_packable_input`
-    // must reject it. The runner would otherwise auto-run; but the *pack*
-    // code path is taken only for non-magic inputs, and a packed container
-    // has the magic, so this hits the double-pack guard.
-    let sb = Sandbox::new("double-pack");
+fn pack_refuses_already_packed_file() {
+    // Re-feeding an already-packed upxz artifact (bare container or self-
+    // extractor) to `upxz` must be refused — the new model has no "run mode"
+    // inside upxz; the user runs `./<file>.upxz` directly instead. The
+    // refuse check fires from the default dispatch (classify -> Packed ->
+    // bail), not from check_packable_input (which now lives inside pack_sfx).
+    let sb = Sandbox::new("refuse-packed");
     let input = sb.write("in.bin", b"some payload bytes".repeat(32).as_slice());
 
-    // First pack succeeds.
     bin().arg(&input).assert().success();
     let packed = sb.expected("in.bin.upxz");
     assert!(packed.is_file());
 
-    // Second pack on the already-packed file must fail (non-zero exit).
-    bin().arg(&packed).assert().failure();
+    // Re-feed the SFX to upxz: must fail with the "already packed" refuse.
+    bin()
+        .arg(&packed)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already a packed upxz"));
 }
 
 #[test]
@@ -175,7 +229,9 @@ fn unpack_preserves_magic_checked_bytes() {
 
     bin().arg(&input).assert().success();
     let packed = sb.expected("big.bin.upxz");
-    assert_has_magic(&packed);
+    // The default pack now emits a self-extractor (not a bare container), so
+    // the UPXZ magic is embedded past the stub/loader, not at offset 0.
+    assert_is_self_extractor(&packed);
 
     bin().arg("-d").arg(&packed).arg("-f").assert().success();
     assert_eq!(fs::read(sb.expected("big.bin")).unwrap(), body);
@@ -192,11 +248,13 @@ fn list_prints_expected_fields() {
     bin().arg(&input).assert().success();
     let packed = sb.expected("note.txt.upxz");
 
+    // The default pack produces a self-extractor; `-l` reports it as such and
+    // shows the embedded container's stats, not the whole file size.
     bin().arg("-l").arg(&packed).assert().success().stdout(
-        predicate::str::contains("magic\tUPXZ")
+        predicate::str::contains("kind\tupxz self-extractor")
             .and(predicate::str::contains("codec\tzstd"))
             .and(predicate::str::contains("name\tnote.txt"))
-            .and(predicate::str::contains("compressed\t"))
+            .and(predicate::str::contains("packed\t"))
             .and(predicate::str::contains("original\t")),
     );
 }
@@ -237,7 +295,8 @@ fn pack_unpack_roundtrip(sb: &Sandbox, body: &[u8], level_args: &[&str]) {
     cmd.arg(&input).assert().success();
 
     let packed = sb.expected("lvl.bin.upxz");
-    assert_has_magic(&packed);
+    // Default pack now produces a self-extractor, not a bare container.
+    assert_is_self_extractor(&packed);
 
     bin().arg("-d").arg(&packed).arg("-f").assert().success();
     assert_eq!(fs::read(sb.expected("lvl.bin")).unwrap(), body);
@@ -510,10 +569,10 @@ fn create_sfx_forwards_argv_macos() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn run_executes_packed_script_and_propagates_exit_zero() {
-    let sb = Sandbox::new("run-zero");
-    // A portable "exit 0" script. `/bin/sh` is available on every unix we
-    // target; on non-unix this test is skipped.
+fn sfx_runs_packed_script_and_propagates_exit_zero() {
+    // The new model has no `upxz <packed>` runner: the SFX runs directly.
+    // Pack to SFX, then exec the SFX (./<packed>.upxz is the new "run").
+    let sb = Sandbox::new("sfx-run-zero");
     #[cfg(unix)]
     {
         let script = b"#!/bin/sh\nexit 0\n";
@@ -521,21 +580,23 @@ fn run_executes_packed_script_and_propagates_exit_zero() {
 
         bin().arg(&input).assert().success();
         let packed = sb.expected("ok.sh.upxz");
-        assert_has_magic(&packed);
+        assert_is_self_extractor(&packed);
 
-        // Running the container must exec the restored script and propagate
-        // its exit code (0 here).
-        bin().arg(&packed).assert().success();
+        // Running the SFX must exec the restored script and propagate 0.
+        let status = std::process::Command::new(&packed)
+            .status()
+            .expect("run SFX");
+        assert!(status.success(), "SFX exited {status:?}");
     }
     #[cfg(not(unix))]
     {
-        let _ = sb; // silence unused warning on non-unix
+        let _ = sb;
     }
 }
 
 #[test]
-fn run_propagates_nonzero_exit_code() {
-    let sb = Sandbox::new("run-nonzero");
+fn sfx_propagates_nonzero_exit_code() {
+    let sb = Sandbox::new("sfx-run-nonzero");
     #[cfg(unix)]
     {
         // `exit 7` — a distinctive code we can assert on.
@@ -545,7 +606,10 @@ fn run_propagates_nonzero_exit_code() {
         bin().arg(&input).assert().success();
         let packed = sb.expected("rc7.sh.upxz");
 
-        bin().arg(&packed).assert().failure().code(predicate::eq(7));
+        let status = std::process::Command::new(&packed)
+            .status()
+            .expect("run SFX");
+        assert_eq!(status.code(), Some(7), "SFX must propagate inner exit 7");
     }
     #[cfg(not(unix))]
     {
@@ -553,29 +617,31 @@ fn run_propagates_nonzero_exit_code() {
     }
 }
 
-/// `upxz <file>.upxz -- a b -c` must forward every arg after `--` to the
-/// restored binary, including hyphen-leading ones. This is a regression test
-/// for a CLI bug where a second positional (`-c`'s output) swallowed the first
-/// trailing arg; the SFX output is now `-o`/`--out`, leaving `ARGS` as the
-/// only positional after `FILE`.
+/// `upxz <file>.upxz -- a b -c` (old) → now: run the SFX directly, passing
+/// args. The SFX forwards every trailing arg verbatim to the inner program,
+/// including hyphen-leading ones. This is the runtime contract the SFX
+/// loader (Linux memfd+fexecve, macOS codesign+execv) must honor.
 #[test]
-fn run_forwards_trailing_args_after_dash_dash() {
-    let sb = Sandbox::new("run-args");
+fn sfx_forwards_trailing_args_after_dash_dash() {
+    let sb = Sandbox::new("sfx-run-args");
     #[cfg(unix)]
     {
-        // Echo all args so we can assert they arrived verbatim.
         let script = b"#!/bin/sh\nprintf 'argc=%d|%s\\n' \"$#\" \"$*\"\n";
         let input = sb.write("echo.sh", script);
         bin().arg(&input).assert().success();
         let packed = sb.expected("echo.sh.upxz");
 
-        let out = bin()
-            .arg(&packed)
-            .arg("--")
+        let out = std::process::Command::new(&packed)
             .args(["first", "-flag", "with space", "--long=1"])
-            .assert()
-            .success();
-        let s = String::from_utf8_lossy(&out.get_output().stdout);
+            .output()
+            .expect("run SFX");
+        assert!(
+            out.status.success(),
+            "SFX exited {:?}: {:?}",
+            out.status,
+            out
+        );
+        let s = String::from_utf8_lossy(&out.stdout);
         assert!(s.contains("argc=4|"), "expected 4 forwarded args, got: {s}");
         assert!(
             s.contains("first -flag with space --long=1"),
@@ -746,122 +812,137 @@ fn bin_missing_entry_errors() {
 // a zstd container (codec id 0) must still round-trip (backward compat).
 // ---------------------------------------------------------------------------
 
-fn assert_has_gzip_magic(path: &PathBuf) {
-    let bytes = fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    assert!(bytes.len() >= 8, "{} too small", path.display());
-    assert_eq!(&bytes[..5], b"UPXZ\x01", "magic prefix wrong");
-    assert_eq!(
-        bytes[5],
-        1,
-        "codec byte must be 1 (gzip) in {}",
-        path.display()
-    );
-    assert_eq!(bytes[6], 0, "reserved byte 6 must be 0");
-    assert_eq!(bytes[7], 0, "reserved byte 7 must be 0");
-}
+// codec-agnostic: --gz selects gzip (codec id 1 in the embedded container's
+// magic). The default pack always produces a self-extractor now, so the gzip
+// codec byte lives at the *embedded* offset — see `assert_embedded_codec_is`
+// above. The whole read path (`-l`/`-t`/`-d`) dispatches on that byte.
+//
 
 #[test]
 fn pack_gz_writes_gzip_magic() {
-    let sb = Sandbox::new("pack-gz-magic");
-    let input = sb.write("hello.txt", b"hello upxz gzip\n".repeat(64).as_slice());
-    let expected = sb.expected("hello.txt.upxz");
+    // The macOS SFX loader is zstd-only for size, so a gzip SFX is refused on
+    // macOS (`gzip_sfx_rejected_on_macos` covers that path). Linux and Windows
+    // support gzip SFXes.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let sb = Sandbox::new("pack-gz-magic");
+        let input = sb.write("hello.txt", b"hello upxz gzip\n".repeat(64).as_slice());
+        let expected = sb.expected("hello.txt.upxz");
 
-    bin().arg("--gz").arg(&input).assert().success();
-
-    assert!(expected.is_file());
-    assert_has_gzip_magic(&expected);
+        bin().arg("--gz").arg(&input).assert().success();
+        assert!(expected.is_file());
+        // The SFX embeds the gzip container; the codec byte is at the
+        // embedded offset, not at offset 0 (which is inside the platform stub).
+        assert_embedded_codec_is(&expected, 1);
+    }
 }
 
 #[test]
 fn pack_gz_unpack_roundtrips_bytes() {
-    let sb = Sandbox::new("pack-gz-rt");
-    let body = b"the gzip round trip\n".repeat(50);
-    let input = sb.write("payload.bin", &body);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let sb = Sandbox::new("pack-gz-rt");
+        let body = b"the gzip round trip\n".repeat(50);
+        let input = sb.write("payload.bin", &body);
 
-    bin().arg("--gz").arg(&input).assert().success();
-    let packed = sb.expected("payload.bin.upxz");
-    assert_has_gzip_magic(&packed);
+        bin().arg("--gz").arg(&input).assert().success();
+        let packed = sb.expected("payload.bin.upxz");
+        assert_embedded_codec_is(&packed, 1);
 
-    // Unpack must restore byte-for-byte through the gzip codec path.
-    bin().arg("-d").arg(&packed).arg("-f").assert().success();
-    assert_eq!(fs::read(sb.expected("payload.bin")).unwrap(), body);
+        // Unpack must restore byte-for-byte through the gzip codec path. The
+        // restore goes through classify -> locate the embedded container ->
+        // decompress, so `-d` on the SFX works the same as on a bare container.
+        bin().arg("-d").arg(&packed).arg("-f").assert().success();
+        assert_eq!(fs::read(sb.expected("payload.bin")).unwrap(), body);
+    }
 }
 
 #[test]
 fn pack_gz_test_reports_gzip() {
-    let sb = Sandbox::new("pack-gz-test");
-    let input = sb.write("data.bin", b"abc".repeat(100).as_slice());
-    bin().arg("--gz").arg(&input).assert().success();
-    let packed = sb.expected("data.bin.upxz");
+    #[cfg(not(target_os = "macos"))]
+    {
+        let sb = Sandbox::new("pack-gz-test");
+        let input = sb.write("data.bin", b"abc".repeat(100).as_slice());
+        bin().arg("--gz").arg(&input).assert().success();
+        let packed = sb.expected("data.bin.upxz");
 
-    bin().arg("-t").arg(&packed).assert().success().stdout(
-        predicate::str::contains("ok\t")
-            .and(predicate::str::contains("gzip round-trip ok"))
-            .and(predicate::str::contains("data.bin")),
-    );
+        bin().arg("-t").arg(&packed).assert().success().stdout(
+            predicate::str::contains("ok\t")
+                .and(predicate::str::contains("gzip round-trip ok"))
+                .and(predicate::str::contains("data.bin")),
+        );
+    }
 }
 
 #[test]
 fn pack_gz_list_shows_gzip_codec() {
-    let sb = Sandbox::new("pack-gz-list");
-    let input = sb.write("note.txt", b"hello world\n".repeat(16).as_slice());
-    bin().arg("--gz").arg(&input).assert().success();
-    let packed = sb.expected("note.txt.upxz");
+    #[cfg(not(target_os = "macos"))]
+    {
+        let sb = Sandbox::new("pack-gz-list");
+        let input = sb.write("note.txt", b"hello world\n".repeat(16).as_slice());
+        bin().arg("--gz").arg(&input).assert().success();
+        let packed = sb.expected("note.txt.upxz");
 
-    bin().arg("-l").arg(&packed).assert().success().stdout(
-        predicate::str::contains("magic\tUPXZ").and(predicate::str::contains("codec\tgzip")),
-    );
+        // `-l` reports the embedded container's codec ("gzip"), not a bare
+        // container's "magic\tUPXZ" line.
+        bin()
+            .arg("-l")
+            .arg(&packed)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("codec\tgzip"));
+    }
 }
 
 #[test]
 fn pack_gz_runs_packed_script() {
-    // The runner path (upxz <file>.upxz) must dispatch on the codec byte and
-    // exec the gzip-decompressed original. We pack a shell script with --gz.
-    let sb = Sandbox::new("pack-gz-run");
-    #[cfg(unix)]
+    // The SFX runtime is the new "run" — the SFX must exec the gzip-decoded
+    // original (Linux/Windows SFX stub supports gzip; macOS refuses gzip SFXes).
+    #[cfg(not(target_os = "macos"))]
     {
-        let script = b"#!/bin/sh\necho gz-ran; exit 0\n";
-        let input = sb.write("hello.sh", script);
+        let sb = Sandbox::new("pack-gz-run");
+        #[cfg(unix)]
+        {
+            let script = b"#!/bin/sh\necho gz-ran; exit 0\n";
+            let input = sb.write("hello.sh", script);
 
-        bin().arg("--gz").arg(&input).assert().success();
-        let packed = sb.expected("hello.sh.upxz");
-        assert_has_gzip_magic(&packed);
+            bin().arg("--gz").arg(&input).assert().success();
+            let packed = sb.expected("hello.sh.upxz");
+            assert_embedded_codec_is(&packed, 1);
 
-        // Resolve the freshly-built upxz binary the way assert_cmd does, so the
-        // test works under both `cargo test` (debug) and `cargo test --release`.
-        let upxz_bin = assert_cmd::cargo::cargo_bin("upxz");
-        let out = std::process::Command::new(upxz_bin)
-            .arg(&packed)
-            .output()
-            .unwrap_or_else(|e| panic!("run upxz: {e}"));
-        assert!(
-            out.status.success(),
-            "upxz run exited {:?}: stderr={}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "gz-ran");
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = sb;
+            // Run the SFX directly (the new "run" path).
+            let out = std::process::Command::new(&packed)
+                .output()
+                .expect("run gzip SFX");
+            assert!(
+                out.status.success(),
+                "gzip SFX exited {:?}: stderr={}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "gz-ran");
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = sb;
+        }
     }
 }
 
 #[test]
 fn backcompat_zstd_container_still_works_after_codec_aware_build() {
-    // A container packed WITHOUT --gz must still use codec id 0 (zstd) and
-    // round-trip through the new codec-aware unpacker. This is the regression
-    // guard for "did we break the v0.1/v0.2 format?".
+    // A default-pack output (no --gz) must still use codec id 0 (zstd) in the
+    // *embedded* container. This is the regression guard for "did we break
+    // the v0.1/v0.2 format?". The UPXZ magic is no longer at offset 0 — the
+    // default pack emits a self-extractor, so the codec byte lives at the
+    // embedded offset.
     let sb = Sandbox::new("backcompat");
     let body = b"backward compat zstd bytes\n".repeat(40);
     let input = sb.write("old.bin", &body);
 
     bin().arg(&input).assert().success(); // no --gz => zstd
     let packed = sb.expected("old.bin.upxz");
-    let bytes = fs::read(&packed).unwrap();
-    assert_eq!(&bytes[..5], b"UPXZ\x01");
-    assert_eq!(bytes[5], 0, "default pack must write codec id 0 (zstd)");
+    assert_embedded_codec_is(&packed, 0); // 0 = zstd
 
     bin().arg("-d").arg(&packed).arg("-f").assert().success();
     assert_eq!(fs::read(sb.expected("old.bin")).unwrap(), body);
@@ -954,15 +1035,15 @@ fn z_level_above_nineteen_is_rejected() {
     bin().arg("-z").arg("20").arg(&input).assert().failure();
 }
 
-/// An empty input file must still pack to a valid container and round-trip to
-/// zero bytes. (zstd happily encodes an empty frame.)
+/// An empty input file must still pack to a valid self-extractor and round-
+/// trip to zero bytes. (zstd happily encodes an empty frame.)
 #[test]
 fn pack_empty_file_roundtrips() {
     let sb = Sandbox::new("empty");
     let input = sb.write("empty.bin", b"");
     bin().arg(&input).assert().success();
     let packed = sb.expected("empty.bin.upxz");
-    assert_has_magic(&packed);
+    assert_is_self_extractor(&packed);
 
     bin().arg("-d").arg(&packed).arg("-f").assert().success();
     assert_eq!(fs::read(sb.expected("empty.bin")).unwrap(), b"");
