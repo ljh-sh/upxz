@@ -277,6 +277,11 @@ fn packed_container_slice<'a>(buf: &'a [u8], file: &Path) -> Result<&'a [u8]> {
 /// restored on unpack? Matches ELF, Mach-O (32/64-bit, both endians), PE/COFF
 /// (`MZ`), and `#!`-shebang scripts. Non-executables (text, archives, images)
 /// return false so they are not needlessly marked executable.
+///
+/// Only called from the Unix chmod branch in `unpack`; on Windows executability
+/// is determined by the `.exe` extension, not permission bits, so this helper
+/// is dead code there. Silence the dead-code lint explicitly.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn looks_executable(bytes: &[u8]) -> bool {
     const MAGIC_ELF: &[u8; 4] = b"\x7fELF";
     const MACHO_BE64: &[u8; 4] = b"\xfe\xed\xfa\xcf";
