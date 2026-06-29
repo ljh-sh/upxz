@@ -9,7 +9,14 @@ name: Release
 # via OIDC (id-token: write), and SHA256SUMS. OpenSSF-aligned.
 #
 # Matrix: x86_64 + aarch64 for Linux and macOS, plus x86_64 Windows.
-#   - aarch64-unknown-linux-gnu builds on a native ARM runner (GA for public
+#   - Linux uses **musl static** targets, not gnu. A statically-linked musl
+#     binary has NO dynamic libc dependency, so one artifact runs on Alpine AND
+#     every glibc distro (Ubuntu/Debian/Fedora/Arch) — gnu (glibc, dynamically
+#     linked) would not run on Alpine. Verified end-to-end on Alpine (Docker):
+#     the binary is fully static and the SFX (memfd_create + fexecve) runs.
+#     musl-gcc (from musl-tools) is used for both C compilation (zstd-sys) and
+#     the final link; each runner's musl-gcc targets that runner's arch.
+#   - aarch64-unknown-linux-musl builds on a native ARM runner (GA for public
 #     repos) so HOST == TARGET.
 #   - x86_64-apple-darwin is CROSS-compiled on the arm64 macos runner (no Intel
 #     mac runner remains) via an explicit `--target`; this needs build.rs to
@@ -52,11 +59,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux: x86_64 native; aarch64 on a native ARM runner.
-          - target: x86_64-unknown-linux-gnu
+          # Linux: musl STATIC (portable to Alpine + all glibc distros).
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
+            musl: true
+          - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
+            musl: true
           # macOS: aarch64 native; x86_64 cross-compiled (needs the target
           # installed — cross_target — and the build.rs --target fix).
           - target: aarch64-apple-darwin
@@ -76,10 +85,18 @@ jobs:
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@4d1965c9142484e48d40c19de54b5cba84953a06 # v1.10.0
 
-      - name: Add cross-compile target
-        # Only the x86_64-apple-darwin build is cross-compiled (on an arm64
-        # macos runner); native builds already have their target installed.
-        if: matrix.cross_target
+      - name: Install musl toolchain
+        # musl static builds need musl-gcc (for zstd-sys C compilation AND the
+        # final static link). On each Linux runner musl-gcc targets that
+        # runner's own arch, so this one package covers both musl targets.
+        if: matrix.musl
+        run: sudo apt-get install -y musl-tools
+
+      - name: Add Rust target
+        # The musl targets and the cross-compiled x86_64-apple-darwin target
+        # are not installed by the default host toolchain; native macOS/Windows
+        # builds already have theirs.
+        if: matrix.musl || matrix.cross_target
         run: rustup target add ${{ matrix.target }}
 
       - name: Build (release, reproducible)
@@ -87,6 +104,17 @@ jobs:
         run: |
           SYSROOT="$(rustc --print sysroot)"
           export RUSTFLAGS="--remap-path-prefix=${{ github.workspace }}=. --remap-path-prefix=$SYSROOT=/rust --remap-path-prefix=$HOME/.cargo=/cargo"
+          # musl static: compile C (zstd-sys) AND link with musl-gcc so the
+          # binary is fully static (no dynamic libc — runs on Alpine + glibc
+          # distros). CC_<triple> selects the C compiler the cc crate uses;
+          # -C linker selects rustc's linker. Each runner's musl-gcc targets
+          # its own arch. The *-musl target spec defaults to crt-static, so no
+          # extra static flag is needed.
+          if [ "${{ matrix.musl }}" = "true" ]; then
+            TARGET=${{ matrix.target }}
+            export "CC_${TARGET//-/_}=musl-gcc"
+            export RUSTFLAGS="$RUSTFLAGS -C linker=musl-gcc"
+          fi
           # Always pass --target: native builds land in target/<host>/release
           # (== target/release in effect) and cross builds land in
           # target/<triple>/release. build.rs reads TARGET (set by --target) to

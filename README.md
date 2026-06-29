@@ -57,7 +57,10 @@ upx-style **flat CLI** (no subcommands) — a flag picks the action:
 ## Install
 
 **Prebuilt binary** (Linux x86_64/arm64, macOS x86_64/arm64, Windows x86_64 — cosign-signed,
-with `SHA256SUMS`) from the [latest release](https://github.com/ljh-sh/upxz/releases/latest):
+with `SHA256SUMS`) from the [latest release](https://github.com/ljh-sh/upxz/releases/latest).
+
+The Linux builds are **musl, statically linked** — one binary runs on Alpine
+*and* every glibc distro (Ubuntu/Debian/Fedora/Arch), no `libc` dependency.
 
 ```bash
 # pick the tarball for your platform, then:
