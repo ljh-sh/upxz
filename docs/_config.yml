@@ -1,0 +1,28 @@
+title: upxz
+description: "upx using zstd — pack a file into a self-extracting binary that still runs."
+
+# Explicit empty theme: the actions/jekyll-build-pages image ships the
+# `minima` gem which auto-injects its own SCSS (normalize.css,
+# minima.scss) into the build when no `theme` is set, and that
+# SCSS gets prepended to (and dwarfs) our 5 KB custom style.css.
+# Setting `theme:` to an empty value disables the default theme so
+# our custom stylesheet is the only CSS served. (`theme: null` is
+# what Jekyll's docs recommend for "no theme".)
+theme: ~
+
+baseurl: "/upxz"
+url: "https://ljh-sh.github.io"
+
+permalink: pretty
+
+markdown: kramdown
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge
+
+plugins:
+  - jekyll-relative-links
+  - jekyll-sitemap
+
+relative_links:
+  enforce_paths: true
