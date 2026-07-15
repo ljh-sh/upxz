@@ -1,4 +1,13 @@
-# Unreleased
+# v0.4.0 — pack = self-extractor (upx-style); musl-static Linux; cross-arch; OpenSSF suite (2026-07-15)
+
+The **upx-style** release. `upxz <FILE>` now produces a runnable self-extractor
+(`<FILE>.upxz`, chmod +x) — `./<FILE>.upxz` runs the original directly. The
+runner mode (`upxz <packed>`) is **gone by design** (the SFX runs itself; feeding
+upxz an already-packed file is now refused with a clear hint to run the SFX
+directly or use `-d`). Linux releases are **musl-static** so they run on
+Alpine and every glibc distro. The release matrix grew to 5 targets (added
+aarch64-linux and x86_64-macos), and the OpenSSF suite (scorecard + codeql +
+dependabot) closes the security-governance loop. **45 tests pass.**
 
 - **pack now produces a self-extractor (upx-style default).** `upxz <FILE>`
   emits a runnable `<FILE>.upxz` (chmod +x) instead of a plain container; you
