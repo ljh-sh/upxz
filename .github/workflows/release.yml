@@ -122,13 +122,18 @@ jobs:
           cargo build --release --locked --target ${{ matrix.target }}
 
       - name: SFX smoke test (Unix)
-        # Pack /bin/echo into a self-extractor and run it, asserting it prints
-        # the forwarded arg. This guards the SFX loader end-to-end: a clean
-        # `cargo build` does NOT catch a loader runtime bug (the macOS
-        # fstat/$INODE64 issue broke every x86_64 SFX while the build was green).
-        # On the arm64 macos runner the x86_64-apple-darwin SFX runs under
-        # Rosetta 2 (preinstalled); aarch64/x86_64-linux run natively. Windows
-        # has no /bin/echo and is covered by the winstub unit tests instead.
+        # Write a tiny fresh shell script and pack it into a self-extractor,
+        # then exec the SFX and assert the forwarded arg is printed. A fresh
+        # adhoc script avoids the aarch64 AMFI issue where re-signing
+        # /bin/echo (an Apple-signed system binary) is rejected with SIGKILL
+        # (exit 137). Scripts don't go through the macOS codesign path, so
+        # they exercise the SFX loader's decompress + chmod + execv chain
+        # without a signing dependency. This still catches a broken loader:
+        # a clean `cargo build` does NOT catch loader runtime bugs (the
+        # fstat/$INODE64 issue broke every x86_64 SFX while the build was
+        # green). On the arm64 macos runner the x86_64-apple-darwin SFX runs
+        # under Rosetta 2 (preinstalled); aarch64/x86_64-linux run natively.
+        # Windows has no /bin/sh and is covered by the winstub unit tests.
         if: runner.os != 'Windows'
         shell: bash
         run: |
@@ -139,7 +144,12 @@ jobs:
           if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ]; then
             arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
           fi
-          "$BIN" -c /bin/echo -o /tmp/smoke.sfx -f
+          cat > /tmp/smoke-inner.sh <<'EOF'
+          #!/bin/sh
+          printf '%s\n' "$@"
+          EOF
+          chmod +x /tmp/smoke-inner.sh
+          "$BIN" -c /tmp/smoke-inner.sh -o /tmp/smoke.sfx -f
           out=$(/tmp/smoke.sfx hello-from-sfx 2>/dev/null)
           [ "$out" = "hello-from-sfx" ] || { echo "SFX smoke FAILED: got '$out'"; exit 1; }
           echo "SFX smoke OK"
