@@ -10,8 +10,8 @@ description: "upx using zstd — pack a file into a self-extracting binary that 
 # what Jekyll's docs recommend for "no theme".)
 theme: ~
 
-baseurl: "/upxz"
-url: "https://ljh-sh.github.io"
+baseurl: ""
+url: "https://upxz.ljh.sh"
 
 permalink: pretty
 
