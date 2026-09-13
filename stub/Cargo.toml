@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
-zstd = "0.13"
+zstd = "0.14"
 # Pure-Rust gzip backend (miniz_oxide). The stub dispatches on the codec byte
 # in the .upxz magic: id 0 = zstd (zstd crate), id 1 = gzip (flate2). Matches
 # the upxz packer's flate2 feature set.

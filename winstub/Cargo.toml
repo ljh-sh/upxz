@@ -14,7 +14,7 @@ path = "src/main.rs"
 # Codec backends: zstd + gzip (flate2/miniz_oxide). Same set the Linux stub
 # uses — the stub is a normal std binary with no size gate, so it can carry
 # both decoders and dispatch on the codec byte in the .upxz magic.
-zstd = "0.13"
+zstd = "0.14"
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 
 # Windows-only: only the Win32 surface the temp-file + exec path needs today
